@@ -25,13 +25,23 @@ const host = process.env.GATEWAY_HOST ?? "127.0.0.1";
 const port = integer("GATEWAY_PORT", 8940, 1, 65535);
 const maxWorkers = integer("GATEWAY_WORKERS", 4, 1, 8);
 const timeoutMs = integer("GATEWAY_TIMEOUT_MS", 120000, 1000, 300000);
+const toolTtlMs = integer("GATEWAY_TOOL_TTL_MS", 300000, 1000, 3600000);
 const modelId = "deepseek-v4.1-flash-free";
-const run = createCliRunner({
+const runner = createCliRunner({
   executable,
+  maxWorkers,
+  toolTtlMs,
   stateDir: process.env.GATEWAY_STATE_DIR ?? "/var/lib/opencode-cli-gateway",
   cacheDir: process.env.GATEWAY_CACHE_DIR ?? "/var/cache/opencode-cli-gateway",
 });
-const server = createGateway({ token, modelId, run, maxWorkers, timeoutMs });
+const server = createGateway({
+  token,
+  modelId,
+  run: runner.run,
+  workerStats: runner.stats,
+  maxWorkers,
+  timeoutMs,
+});
 server.on("error", (error) => {
   console.error(
     JSON.stringify({ event: "server_error", code: error.code ?? "unknown" }),
@@ -57,5 +67,6 @@ for (const name of ["SIGINT", "SIGTERM"]) {
     stopping = true;
     server.close();
     server.closeAllConnections();
+    void runner.close();
   });
 }

@@ -11,6 +11,9 @@ const request = {
   modelId: "deepseek-v4.1-flash-free",
   messages: [{ role: "user", content: "--command bad\n한글 입력" }],
   maxOutputTokens: 512,
+  tools: [],
+  toolChoice: "none",
+  parallelToolCalls: true,
 };
 const finish = {
   type: "step_finish",
@@ -32,7 +35,7 @@ async function fixture(t, source) {
   const root = await mkdtemp(join(tmpdir(), "opencode-runner-test-"));
   let captured;
   let child;
-  const run = createCliRunner({
+  const runner = createCliRunner({
     executable: "/official/opencode",
     stateDir: join(root, "state"),
     cacheDir: join(root, "cache"),
@@ -43,10 +46,11 @@ async function fixture(t, source) {
     },
   });
   t.after(async () => {
+    await runner.close();
     await rm(root, { recursive: true, force: true });
   });
   return {
-    run,
+    run: runner.run,
     root,
     get captured() {
       return captured;

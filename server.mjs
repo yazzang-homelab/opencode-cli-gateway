@@ -1,12 +1,17 @@
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { createServer } from "node:http";
 import { GatewayError } from "./errors.mjs";
+import {
+  normalizeTools,
+  normalizeToolChoice,
+  normalizeHistoryCalls,
+  validateHistory,
+} from "./tools.mjs";
 
 const DEFAULT_MODEL_ID = "deepseek-v4.1-flash-free";
 const MAX_STREAM_BUFFER_BYTES = 1024 * 1024;
-const ROLES = new Set(["system", "developer", "user", "assistant"]);
+const ROLES = new Set(["system", "developer", "user", "assistant", "tool"]);
 const TEXT_PART_TYPES = new Set(["text", "input_text", "output_text"]);
-const MESSAGE_FIELDS = new Set(["role", "content"]);
 const TEXT_PART_FIELDS = new Set(["type", "text"]);
 const STREAM_FIELDS = new Set(["include_usage"]);
 const REQUEST_FIELDS = new Set([
@@ -25,11 +30,13 @@ const REQUEST_FIELDS = new Set([
   "n",
 ]);
 const METADATA = Object.freeze({
-  gateway: "opencode-cli-agent-text-relay",
+  gateway: "opencode-cli-caller-tool-relay",
   system_message_semantics:
     "system·developer 메시지는 네이티브 OpenCode 에이전트에게 전달되는 대화 기록이며 에이전트의 시스템 지시를 대체하지 않습니다.",
   streaming: "completed_text_parts",
-  supports_tool_use: false,
+  supports_tool_use: true,
+  tool_execution: "caller_owned",
+  tool_continuation: "live_native_session",
   supports_vision: false,
 });
 
@@ -75,14 +82,39 @@ function sampling(value, min, max, label) {
 
 function normalizeMessage(message) {
   if (!isObject(message) || !ROLES.has(message.role)) {
-    throw invalid(
-      "메시지 역할은 system, developer, user, assistant만 지원합니다.",
-    );
+    throw invalid("지원하지 않는 메시지 역할입니다.");
   }
-  onlyFields(message, MESSAGE_FIELDS, "메시지");
-  if (typeof message.content === "string") {
-    return { role: message.role, content: message.content };
+  const fields = new Set([
+    "role",
+    "content",
+    ...(message.role === "assistant" ? ["tool_calls"] : []),
+    ...(message.role === "tool" ? ["tool_call_id", "name"] : []),
+  ]);
+  onlyFields(message, fields, "메시지");
+  const result = { role: message.role };
+  if (message.role === "assistant" && has(message, "tool_calls"))
+    result.tool_calls = normalizeHistoryCalls(message.tool_calls);
+  if (message.role === "tool") {
+    if (
+      typeof message.tool_call_id !== "string" ||
+      !message.tool_call_id.length
+    )
+      throw invalid("도구 결과에 tool_call_id가 필요합니다.");
+    result.tool_call_id = message.tool_call_id;
+    if (has(message, "name")) {
+      if (typeof message.name !== "string")
+        throw invalid("도구 이름은 문자열이어야 합니다.");
+      result.name = message.name;
+    }
   }
+  if (typeof message.content === "string")
+    return { ...result, content: message.content };
+  if (
+    message.role === "assistant" &&
+    result.tool_calls &&
+    (message.content === null || message.content === undefined)
+  )
+    return { ...result, content: "" };
   if (!Array.isArray(message.content)) {
     throw invalid("메시지 내용은 문자열 또는 텍스트 파트 배열이어야 합니다.");
   }
@@ -94,7 +126,7 @@ function normalizeMessage(message) {
         typeof part.text !== "string"
       ) {
         throw invalid(
-          "이미지·오디오·도구 호출은 지원하지 않으며 텍스트 파트만 허용합니다.",
+          "메시지 내용은 텍스트 파트만 허용합니다.",
           "unsupported_content",
         );
       }
@@ -102,7 +134,7 @@ function normalizeMessage(message) {
       return part.text;
     })
     .join("");
-  return { role: message.role, content };
+  return { ...result, content };
 }
 
 function normalizeRequest(body, modelId) {
@@ -121,25 +153,13 @@ function normalizeRequest(body, modelId) {
   if (!Array.isArray(body.messages) || body.messages.length === 0) {
     throw invalid("messages는 비어 있지 않은 배열이어야 합니다.");
   }
+  const tools = normalizeTools(body.tools);
+  const toolChoice = normalizeToolChoice(body.tool_choice, tools);
   if (
-    has(body, "tools") &&
-    (!Array.isArray(body.tools) || body.tools.length !== 0)
-  ) {
-    throw invalid("외부 함수 tools는 지원하지 않습니다.", "unsupported_tools");
-  }
-  if (
-    has(body, "tool_choice") &&
-    body.tool_choice !== "auto" &&
-    body.tool_choice !== "none"
-  ) {
-    throw invalid("강제 도구 선택은 지원하지 않습니다.", "unsupported_tools");
-  }
-  if (has(body, "parallel_tool_calls") && body.parallel_tool_calls !== false) {
-    throw invalid(
-      "병렬 도구 호출은 지원하지 않으며 false만 허용합니다.",
-      "unsupported_tools",
-    );
-  }
+    has(body, "parallel_tool_calls") &&
+    typeof body.parallel_tool_calls !== "boolean"
+  )
+    throw invalid("parallel_tool_calls는 불리언이어야 합니다.");
   if (has(body, "n") && body.n !== 1) {
     throw invalid("n은 정수 1만 지원합니다.", "unsupported_parameter");
   }
@@ -182,7 +202,11 @@ function normalizeRequest(body, modelId) {
     modelId,
     messages: body.messages.map(normalizeMessage),
     maxOutputTokens: body.max_completion_tokens ?? body.max_tokens ?? 1024,
+    tools,
+    toolChoice,
+    parallelToolCalls: body.parallel_tool_calls ?? true,
   };
+  validateHistory(normalized.messages);
   if (has(body, "temperature"))
     normalized.temperature = sampling(body.temperature, 0, 2, "temperature");
   if (has(body, "top_p")) normalized.topP = sampling(body.top_p, 0, 1, "top_p");
@@ -301,7 +325,7 @@ function checkResult(result) {
   if (
     !isObject(result) ||
     typeof result.text !== "string" ||
-    !["stop", "length"].includes(result.finishReason)
+    !["stop", "length", "tool_calls"].includes(result.finishReason)
   ) {
     throw new GatewayError(
       502,
@@ -309,6 +333,32 @@ function checkResult(result) {
       "네이티브 실행 결과 형식이 잘못되었습니다.",
     );
   }
+  if (result.finishReason === "tool_calls") {
+    try {
+      normalizeHistoryCalls(result.toolCalls);
+    } catch {
+      throw new GatewayError(
+        502,
+        "invalid_runner_result",
+        "네이티브 함수 호출 응답이 잘못되었습니다.",
+      );
+    }
+    if (
+      typeof result.commit !== "function" ||
+      typeof result.cancel !== "function"
+    )
+      throw new GatewayError(
+        502,
+        "invalid_runner_result",
+        "도구 호출 응답의 수명 제어가 없습니다.",
+      );
+  } else if (result.toolCalls?.length)
+    throw new GatewayError(
+      502,
+      "invalid_runner_result",
+      "함수 호출과 종료 이유가 일치하지 않습니다.",
+    );
+  if (result.usage === null && result.finishReason === "tool_calls") return;
   if (
     !isObject(result.usage) ||
     ["prompt_tokens", "completion_tokens", "total_tokens"].some(
@@ -328,6 +378,7 @@ export function createGateway({
   token,
   modelId = DEFAULT_MODEL_ID,
   run,
+  workerStats,
   maxWorkers = 4,
   timeoutMs = 120000,
   maxBodyBytes = 1048576,
@@ -379,6 +430,15 @@ export function createGateway({
     let stream = false;
     let includeUsage = false;
     let streamStarted = false;
+    let turnResult;
+    let responseDone;
+    const responseComplete = new Promise((resolve) => {
+      responseDone = resolve;
+    });
+    const onFinished = () => {
+      turnResult?.commit?.();
+      responseDone();
+    };
     const abort = (reason) => {
       if (!signal.aborted) controller.abort(reason);
     };
@@ -393,6 +453,7 @@ export function createGateway({
           "클라이언트 연결이 종료되었습니다.",
         ),
       );
+      responseDone();
     };
     const writable = () =>
       !terminal && !disconnected && !res.destroyed && !res.writableEnded;
@@ -495,6 +556,7 @@ export function createGateway({
     req.once("error", onDisconnected);
     res.once("close", onDisconnected);
     res.once("error", onDisconnected);
+    res.once("finish", onFinished);
     try {
       const parsed = normalizeRequest(
         await readJson(req, maxBodyBytes, signal),
@@ -536,12 +598,24 @@ export function createGateway({
         );
       };
       const result = await run(parsed.normalized, { signal, onText });
+      turnResult = result;
       signal.throwIfAborted();
       if (!writable()) return;
       checkResult(result);
       if (stream) {
         if (!streamStarted && result.text.length > 0) onText(result.text);
         beginStream();
+        for (const [index, call] of (result.toolCalls ?? []).entries()) {
+          writeEvent(
+            chunk([
+              {
+                index: 0,
+                delta: { tool_calls: [{ index, ...call }] },
+                finish_reason: null,
+              },
+            ]),
+          );
+        }
         writeEvent(
           chunk([{ index: 0, delta: {}, finish_reason: result.finishReason }]),
         );
@@ -559,7 +633,13 @@ export function createGateway({
           choices: [
             {
               index: 0,
-              message: { role: "assistant", content: result.text },
+              message: {
+                role: "assistant",
+                content: result.text || (result.toolCalls?.length ? null : ""),
+                ...(result.toolCalls?.length
+                  ? { tool_calls: result.toolCalls }
+                  : {}),
+              },
               finish_reason: result.finishReason,
             },
           ],
@@ -568,13 +648,16 @@ export function createGateway({
         });
       }
     } catch (error) {
+      await turnResult?.cancel?.();
       sendFailure(error);
     } finally {
+      await responseComplete;
       clearTimeout(timer);
       req.off("aborted", onDisconnected);
       req.off("error", onDisconnected);
       res.off("close", onDisconnected);
       res.off("error", onDisconnected);
+      res.off("finish", onFinished);
       if (admitted) active -= 1;
     }
   }
@@ -605,7 +688,12 @@ export function createGateway({
             { allow: "GET" },
           );
         } else {
-          sendJson(res, 200, { status: "ok", active, maxWorkers });
+          sendJson(res, 200, {
+            status: "ok",
+            active,
+            maxWorkers,
+            ...(workerStats ? { workers: workerStats() } : {}),
+          });
         }
         return;
       }
@@ -650,8 +738,12 @@ export function createGateway({
               object: "model",
               created: modelCreated,
               owned_by: "opencode-cli-gateway",
-              supports_tool_use: false,
+              supports_tool_use: true,
               supports_vision: false,
+              context_window: 128000,
+              context_length: 128000,
+              max_output_tokens: 8192,
+              input_modalities: ["text"],
               metadata: METADATA,
             },
           ],

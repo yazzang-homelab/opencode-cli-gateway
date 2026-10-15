@@ -1,80 +1,67 @@
 # opencode-cli-gateway
 
-정식 **OpenCode CLI를 자식 프로세스로 실행**하고, 그 텍스트 응답을 OpenAI Chat Completions 형태로 중계하는 작은 HTTP 서버입니다. 제공 모델은 `deepseek-v4.1-flash-free` 하나이며, CLI 의존성은 `opencode-ai@1.19.0`으로 고정합니다.
+정식 **OpenCode CLI를 실행**해 텍스트 생성과 **클라이언트 소유 함수 도구의 호출·결과 왕복**을 OpenAI Chat Completions API로 중계합니다. 모델은 `deepseek-v4.1-flash-free`, CLI는 `opencode-ai@1.19.0`으로 고정합니다.
 
-**비공식·독립 프로젝트입니다.** OpenCode, Anthropic, OpenAI, Gajae-Code의 공식 게이트웨이가 아니며, 해당 프로젝트의 후원·인증·완전한 호환성을 주장하지 않습니다. 여기서 “정식 CLI”란 사용하는 상류 실행 파일을 뜻하며, 이 게이트웨이가 공식 제품이라는 뜻이 아닙니다.
+**비공식·독립 프로젝트입니다.** OpenCode·Anthropic·OpenAI·Gajae-Code의 공식 제품이나 완전한 호환성을 주장하지 않습니다. 다른 클라이언트로 위장하는 헤더를 사용하지 않습니다. 무료 모델의 제공 기간·한도·가격·가용성은 상류 정책에 달려 있습니다.
 
-## 구조와 사용 범위
+## 실행과 도구 소유권
 
 ```text
-텍스트 API 클라이언트
-  → 이 게이트웨이: POST /v1/chat/completions
-  → 정식 opencode-ai@1.19.0: opencode run --pure --agent build --format json
-  → OpenCode 공급자의 deepseek-v4.1-flash-free
+클라이언트 → Chat Completions → 정식 OpenCode CLI → 모델
+                                  ↕ 공식 MCP
+                             대기 중인 함수 호출
+                                  ↕
+클라이언트 ← tool_calls + 호출 ID ← 게이트웨이
+클라이언트가 실제 도구 실행
+클라이언트 → tool_call_id + 실제 결과 → 같은 MCP 호출 → 같은 CLI의 후속 추론
 ```
 
-- 상류 HTTP API를 재구현하거나 다른 클라이언트인 것처럼 헤더를 위장하지 않습니다.
-- 요청마다 CLI 프로세스와 작업 디렉터리를 만들고, 종료 시 작업 디렉터리를 삭제합니다. `HOME`과 설정·데이터·상태용 XDG 디렉터리를 요청별로 분리하며, 캐시 디렉터리는 공유합니다.
-- 네이티브 에이전트의 도구 권한은 `ask`로 설정합니다. 고정 버전의 비대화형 실행에서 실제 Bash 도구 요청이 자동 거절되는 것을 확인했습니다. CLI가 `tool_use` 이벤트를 내보내면 게이트웨이도 오류로 종료합니다. 도구 실행을 제공하는 서비스가 아닙니다.
-- `system`·`developer` 메시지는 **네이티브 에이전트에게 전달하는 대화 기록**입니다. CLI 자체의 시스템 지시를 교체하거나, 원래 API의 역할 우선순위를 그대로 구현하지 않습니다.
-- 무료 모델의 현재 제공 여부·한도·정책은 상류에 달려 있습니다. 무료라는 이름이나 과거 성공 기록은 향후 가용성·가격·성능의 보장이 아닙니다.
+- **파일 읽기·쓰기·셸 실행은 클라이언트가 수행합니다.** 게이트웨이는 클라이언트 함수의 이름·인자를 반환하고 실제 결과를 기다립니다. 게이트웨이 호스트에서 해당 함수를 실행하지 않습니다.
+- 네이티브 OpenCode의 기본 도구는 `ask`로 두며, 고정 버전의 비대화형 CLI가 권한을 자동 거절합니다. 요청별로 등록한 `caller_*` MCP 도구만 허용합니다. 네이티브 기본 도구 이벤트가 나오면 실패 처리해 클라이언트가 이중 실행하지 않게 합니다.
+- MCP 어댑터는 실제 결과가 오기 전까지 Promise를 완료하지 않습니다. 위임 오류나 가짜 결과를 반환해 모델을 재시작하는 방식이 아닙니다.
+- MCP 이름 길이에 맞춘 짧은 내부 이름을 사용하지만, 외부 API의 함수 이름·인자는 그대로 보존합니다. 64자 원래 함수 이름의 실제 MCP SDK 왕복도 검증했습니다.
+- 도구 결과 대기 중에는 **CLI·MCP 프로세스와 요청 디렉터리를 유지**합니다. 완료·진행 중 요청 취소·대기 TTL 만료·서버 종료 시 정리합니다. 게이트웨이를 재시작하면 보류 중 세션은 복구되지 않습니다.
+- `system`·`developer` 메시지는 첫 CLI에 전달하는 대화 기록입니다. 네이티브 에이전트의 시스템 지시나 역할 우선순위를 교체하는 API는 아닙니다.
 
-파일 수정, 셸 실행, MCP, 외부 함수 호출이 필요한 일반 코딩 에이전트의 백엔드로는 사용할 수 없습니다. 이미 주어진 텍스트에 대한 질문·요약·생성에 맞춘 중계기입니다.
+이 경계는 GJC Cursor 공급자가 호출 ID·이름·인자를 전달한 뒤 실제 실행 결과를 기다리는 계약을 참고했습니다. 네이티브 도구를 이미 실행한 뒤 표시만 하는 agent-level 공급자와는 다릅니다.
 
-## 지원·미지원
+## 지원 범위
 
-| 항목                        | 상태와 정확한 범위                                                                                                                  |
-| --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `POST /v1/chat/completions` | Bearer 인증이 필요한 텍스트 전용 API                                                                                                |
-| `GET /v1/models`            | Bearer 인증 필요. 정확한 모델 ID와 `supports_tool_use: false`, `supports_vision: false` 제공                                        |
-| `GET /healthz`              | 인증 없이 프로세스 상태와 `active`, `maxWorkers` 반환. 상류 모델의 정상 동작을 검사하지 않음                                        |
-| 입력 역할                   | `system`, `developer`, `user`, `assistant`. 위의 대화 기록 의미에 한정                                                              |
-| 입력 내용                   | 문자열 또는 `text`·`input_text`·`output_text` 타입의 텍스트 파트 배열                                                               |
-| 비스트리밍                  | `choices[0].message.content`에 응답 텍스트 제공                                                                                     |
-| SSE                         | `stream: true`, 선택적으로 `stream_options.include_usage: true`. **완성된 CLI 텍스트 파트 단위**이며 모델 토큰별 실시간 전송이 아님 |
-| 출력 한도                   | `max_tokens` 또는 `max_completion_tokens`: 1~8192, 생략 시 1024. 둘 다 보내면 값이 같아야 함                                        |
-| 샘플링                      | `temperature`: 0~2, `top_p`: 0~1. CLI 에이전트 설정으로 전달                                                                        |
-| 사용량                      | CLI의 사용량을 변환. 추론·캐시 토큰도 CLI 보고 범위에서 합산                                                                        |
-| 외부 함수 도구              | 비어 있지 않은 `tools`는 **400**. `tool_calls`, 도구 결과 메시지, `tool` 역할도 미지원                                              |
-| 도구 관련 빈 설정           | `tools: []`, `tool_choice: "none"` 또는 `"auto"`, `parallel_tool_calls: false`는 허용하지만 도구 기능을 제공하지는 않음             |
-| 이미지·오디오·동영상        | 입력·출력 모두 미지원. 비텍스트 콘텐츠는 400                                                                                        |
-| JSON 강제·구조화 출력       | `response_format`·JSON Schema 미지원. 프롬프트로 JSON을 요청할 수 있으나 형식을 보장하지 않음                                       |
-| 응답 저장                   | 저장 기능은 미지원. `store: false`만 수용하며 `true`·문자열·`null`은 400. 이 옵션은 CLI 상태·캐시의 무기록을 보장하지 않음          |
-| 그 밖의 요청 필드           | 허용 목록에 없는 필드는 400. 예: `stop`, `seed`, `reasoning_effort`, `metadata`                                                     |
-| 복수 후보                   | `n: 1`만 허용                                                                                                                       |
-| Responses·Messages API      | `/v1/responses`, `/v1/messages`를 직접 제공하지 않음. 별도 프로토콜 프록시 필요                                                     |
+| 항목               | 지원과 제한                                                                                                                                                                 |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| API                | `POST /v1/chat/completions`, `GET /v1/models`: Bearer 인증 필요                                                                                                             |
+| 상태               | `GET /healthz`: 인증 없이 HTTP `active`와 네이티브 `workers` 상태 제공. 상류 생성 검사는 아님                                                                               |
+| 도구               | OpenAI `type: function`, 함수 정의 최대 64개, 이름은 영숫자·밑줄·하이픈 1~64자                                                                                              |
+| 입력               | `system`, `developer`, `user`, `assistant`, `tool`. 텍스트 문자열·텍스트 파트 배열                                                                                          |
+| 도구 이력          | `assistant.tool_calls`와 `tool.tool_call_id`; 모든 호출에 정확히 한 번씩 결과를 회신                                                                                        |
+| 도구 선택          | `auto`, `none`, `required`, 선언된 함수 강제 선택. 모델이 선택 제약을 위반하면 명시적 오류이며 호출을 합성하지 않음                                                         |
+| 병렬 도구          | 보류 호출을 모두 보존. `parallel_tool_calls: false`는 한 번에 하나씩 전달; 나머지는 다음 결과 왕복에서 전달                                                                 |
+| JSON Schema        | object 루트, 함수당 16KiB. draft-07·2020-12, 로컬 JSON Pointer 참조. 외부 참조·중첩 `$id`·동적 참조 미지원                                                                  |
+| 인자 검증          | 원래 호출자 스키마로 검증. 정식 MCP의 루트 속성 제한이 스키마를 바꾸지 않도록 내부 포장을 사용하고, 클라이언트에는 원래 인자만 반환                                         |
+| SSE                | 완성된 텍스트 파트와 완성된 함수 호출을 청크로 전송. 모델 토큰별 실시간 스트림은 아님                                                                                       |
+| 출력 한도          | `max_tokens` 또는 `max_completion_tokens` 1~8192, 기본 1024. 둘 다 있으면 값이 같아야 함                                                                                    |
+| 샘플링             | `temperature` 0~2, `top_p` 0~1                                                                                                                                              |
+| 사용량             | 도구 호출 직후 아직 네이티브 사용량이 없으면 `usage: null`. 이후 보고된 단계 사용량을 중복 없이 반환                                                                        |
+| 미지원             | 이미지·오디오·동영상·이미지 도구 결과, legacy `function` 역할, custom/freeform 도구의 직접 입력, `response_format`, `stop`, `seed`, `reasoning_effort` 등 허용 목록 밖 필드 |
+| 응답 저장          | `store: false`만 허용. 상태·캐시·상류까지 무기록임을 보장하는 옵션은 아님                                                                                                   |
+| Responses·Messages | 직접 제공하지 않음. 별도 프로토콜 프록시 필요                                                                                                                               |
 
-**“도구를 쓰지 말라”는 프롬프트만으로는 충분하지 않습니다.** 클라이언트가 비어 있지 않은 `tools`를 선언하면 실제 호출 여부와 무관하게 400입니다. `tool_choice: "none"`도 이 선언을 허용하게 만들지 않습니다.
+일반 함수 도구는 실제 왕복을 지원하지만, 모든 코딩 클라이언트의 모든 요청 필드·도구 종류까지 호환된다는 뜻은 아닙니다. JSON Schema의 `format`은 주석으로 취급하며 URI·날짜 등의 의미 검증을 강제하지 않습니다. 클라이언트도 자체 인자 검증·권한 정책·실행 격리를 적용해야 합니다.
 
-## 요구 사항과 설치
+## 설치와 로컬 실행
 
-- Linux, Node.js **20 이상**, npm
-- 실행 환경에 맞는 정식 네이티브 OpenCode CLI. `npm install`로 고정 의존성 **`opencode-ai@1.19.0`**을 설치합니다.
-- 상류 OpenCode 서비스로 나갈 수 있는 네트워크
-- 아래 예시는 Bash와 curl 사용. 선택 기능인 벤치·원격 등록에는 Python 3, 원격 등록에는 SSH도 필요합니다. Python 추가 패키지는 필요하지 않습니다.
-- macOS·Windows 실행이나 다른 OpenCode 버전과의 호환성은 검증하지 않았습니다.
+Linux, Node.js 20 이상, npm, 상류 네트워크 연결이 필요합니다. 벤치·SSH 등록 스크립트에는 Python 3이 필요하며 추가 Python 패키지는 없습니다. 다른 OS·CLI 버전은 검증하지 않았습니다.
 
 ```bash
 git clone https://github.com/yazzang-homelab/opencode-cli-gateway.git
 cd opencode-cli-gateway
-npm install
-```
-
-`package.json`과 잠금 파일의 CLI 버전을 임의로 올리지 마세요. 이 구현은 해당 버전의 JSON 이벤트와 비대화형 권한 동작에 의존합니다.
-
-## 로컬 실행
-
-저장소 루트에서 실행합니다. 일반 사용자 실행에서는 반드시 **사용자가 쓸 수 있는 상태·캐시 디렉터리**를 지정합니다. 코드의 `/var/lib`·`/var/cache` 기본값은 뒤의 systemd 배포용입니다.
-
-```bash
+npm ci
 umask 077
 export GATEWAY_STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/opencode-cli-gateway"
 export GATEWAY_CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/opencode-cli-gateway"
 mkdir -p "$GATEWAY_STATE_DIR" "$GATEWAY_CACHE_DIR"
 chmod 700 "$GATEWAY_STATE_DIR" "$GATEWAY_CACHE_DIR"
 export GATEWAY_TOKEN_FILE="$GATEWAY_STATE_DIR/token"
-
-# 기존 토큰은 유지합니다. 새 토큰은 32바이트 난수의 64자리 16진수이며 화면에 출력하지 않습니다.
 if [[ ! -e "$GATEWAY_TOKEN_FILE" ]]; then
   node --input-type=module -e '
     import { randomBytes } from "node:crypto";
@@ -83,121 +70,88 @@ if [[ ! -e "$GATEWAY_TOKEN_FILE" ]]; then
   '
 fi
 chmod 600 "$GATEWAY_TOKEN_FILE"
-
 GATEWAY_HOST=127.0.0.1 GATEWAY_PORT=8940 npm start
 ```
 
-토큰을 소스 코드, 셸 명령의 문자열 리터럴, 저장소 설정 파일에 넣지 마세요. 서버는 토큰 값이 아니라 `GATEWAY_TOKEN_FILE`의 경로만 받습니다. 클라이언트에 토큰을 옮길 때는 보안 비밀 저장소나 별도의 안전한 전달 경로를 사용하세요.
-
-### 환경변수
-
-| 변수                  | 기본값                                  | 의미                                                                                                          |
-| --------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| `GATEWAY_TOKEN_FILE`  | 필수                                    | Bearer 토큰 파일. 앞뒤 공백 제거 후 32자 이상이며 내부 공백이 없어야 함. 운영자가 파일 권한을 `0600`으로 설정 |
-| `GATEWAY_HOST`        | `127.0.0.1`                             | 수신 주소. 로컬 사용에서는 변경하지 않는 것을 권장                                                            |
-| `GATEWAY_PORT`        | `8940`                                  | 포트, 1~65535                                                                                                 |
-| `GATEWAY_WORKERS`     | `4`                                     | 동시 CLI 실행 수, 1~8. 초과 요청은 대기열 없이 429                                                            |
-| `GATEWAY_TIMEOUT_MS`  | `120000`                                | 요청 전체 제한 시간, 1000~300000밀리초                                                                        |
-| `GATEWAY_STATE_DIR`   | `/var/lib/opencode-cli-gateway`         | 요청별 임시 작업 공간의 상위 디렉터리. 일반 사용자 실행은 위 예시처럼 홈 아래 경로로 변경                     |
-| `GATEWAY_CACHE_DIR`   | `/var/cache/opencode-cli-gateway`       | CLI 공용 캐시. 일반 사용자 실행은 쓰기 가능한 홈 캐시로 변경                                                  |
-| `OPENCODE_EXECUTABLE` | 프로젝트의 `node_modules/.bin/opencode` | 실행 가능한 정식 CLI 경로. 별도 경로도 검증한 1.19.0 사용                                                     |
-
-아래 예시의 `GATEWAY_API_KEY`는 **클라이언트·벤치용 환경변수**입니다. 서버의 필수 설정 `GATEWAY_TOKEN_FILE`을 대신하지 않습니다.
-
-## API 사용 예시
-
-다른 터미널에서 같은 사용자의 토큰 파일을 읽습니다. 값은 출력하지 않습니다.
+토큰을 화면에 출력하거나 소스에 저장하지 마세요. 별도 터미널에서 같은 토큰 파일을 읽습니다.
 
 ```bash
 export GATEWAY_TOKEN_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/opencode-cli-gateway/token"
 IFS= read -r GATEWAY_API_KEY < "$GATEWAY_TOKEN_FILE"
 export GATEWAY_API_KEY
 export GATEWAY_BASE_URL=http://127.0.0.1:8940/v1
-
-curl --fail-with-body --silent --show-error http://127.0.0.1:8940/healthz
-
 curl --fail-with-body --silent --show-error \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  "$GATEWAY_BASE_URL/models"
-```
-
-### 텍스트 응답
-
-```bash
+  -H "Authorization: Bearer $GATEWAY_API_KEY" "$GATEWAY_BASE_URL/models"
 curl --fail-with-body --silent --show-error \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  -H 'Content-Type: application/json' \
-  "$GATEWAY_BASE_URL/chat/completions" \
-  --data-binary '{
-    "model": "deepseek-v4.1-flash-free",
-    "messages": [{"role": "user", "content": "17의 제곱을 숫자로만 답하세요."}],
-    "max_tokens": 128,
-    "stream": false
+  -H "Authorization: Bearer $GATEWAY_API_KEY" -H 'Content-Type: application/json' \
+  "$GATEWAY_BASE_URL/chat/completions" --data-binary '{
+    "model":"deepseek-v4.1-flash-free",
+    "messages":[{"role":"user","content":"17의 제곱을 숫자로만 답하세요."}],
+    "max_tokens":256
   }'
 ```
 
-### SSE와 사용량
+### 도구 왕복 규칙
+
+1. `tools`에 JSON Schema 함수 정의를 제공해 요청합니다.
+2. 응답의 `finish_reason: "tool_calls"`, `message.tool_calls[].id/name/arguments`를 읽습니다. 인자는 JSON 문자열입니다.
+3. **그 assistant 메시지를 그대로 대화에 추가**하고 클라이언트에서 허용된 도구만 실행합니다.
+4. 각 호출의 실제 결과를 `{"role":"tool","tool_call_id":"반환된 ID","content":"실제 결과"}`로 추가합니다.
+5. **동일한 대화 이력·도구 정의·모델·출력 한도·샘플링 설정**으로 요청합니다. 같은 네이티브 CLI의 보류 호출에 결과가 회신됩니다. 추가 호출이 나오면 반복합니다.
+
+원래 이력을 바꾸거나 결과를 누락·중복·다른 세션 ID로 회신하면 거절합니다. 도구 결과 순서는 바꿀 수 있지만 직전 응답의 모든 호출 결과가 필요합니다. 같은 세션을 동시에 재개할 수 없습니다. 새로운 사용자 턴은 완료된 이전 도구 이력을 포함해 새 CLI에서 시작할 수 있습니다.
+
+실행 가능한 검증 클라이언트도 제공합니다. 모델이 도구를 호출한 **뒤에** 클라이언트가 무작위 값을 생성해 실제 결과로 반환하고 최종 답과 비교합니다. 임의 셸 명령을 실행하는 벤치가 아닙니다.
 
 ```bash
-curl --fail-with-body --silent --show-error --no-buffer \
-  -H "Authorization: Bearer $GATEWAY_API_KEY" \
-  -H 'Content-Type: application/json' \
-  "$GATEWAY_BASE_URL/chat/completions" \
-  --data-binary '{
-    "model": "deepseek-v4.1-flash-free",
-    "messages": [{"role": "user", "content": "HTTP를 두 문장으로 설명하세요."}],
-    "max_tokens": 256,
-    "stream": true,
-    "stream_options": {"include_usage": true}
-  }'
+python3 benchmark.py --base-url http://127.0.0.1:8940/v1 \
+  --api chat --workload tools --key-file "$GATEWAY_TOKEN_FILE" --workers 1 2 4
 ```
 
-SSE는 `data:` 프레임과 마지막 `[DONE]`을 사용합니다. 최초 텍스트가 나오기까지 CLI 시작과 파트 생성 시간이 걸립니다. 스트림 시작 후 실패하면 이미 전송한 HTTP 상태를 바꿀 수 없으므로, 클라이언트는 SSE의 `error`도 확인해야 합니다.
+## 환경변수와 자원 상한
 
-### 주요 오류와 상한
+| 변수                  | 기본값                                | 의미                                                     |
+| --------------------- | ------------------------------------- | -------------------------------------------------------- |
+| `GATEWAY_TOKEN_FILE`  | 필수                                  | 공백 없는 32자 이상 Bearer 토큰 파일                     |
+| `GATEWAY_HOST`        | `127.0.0.1`                           | 수신 주소                                                |
+| `GATEWAY_PORT`        | `8940`                                | 1~65535                                                  |
+| `GATEWAY_WORKERS`     | `4`                                   | 네이티브 CLI 상한, 1~8. **도구 결과 대기도 워커를 점유** |
+| `GATEWAY_TIMEOUT_MS`  | `120000`                              | HTTP 한 단계 제한, 1000~300000ms                         |
+| `GATEWAY_TOOL_TTL_MS` | `300000`                              | 응답 전달 후 외부 결과 대기 제한, 1000~3600000ms         |
+| `GATEWAY_STATE_DIR`   | `/var/lib/opencode-cli-gateway`       | 요청별 작업·IPC·네이티브 상태 디렉터리                   |
+| `GATEWAY_CACHE_DIR`   | `/var/cache/opencode-cli-gateway`     | 공용 캐시                                                |
+| `OPENCODE_EXECUTABLE` | 프로젝트 `node_modules/.bin/opencode` | 고정 버전 정식 실행 파일                                 |
 
-| 상태 | 확인할 내용                                                                               |
-| ---- | ----------------------------------------------------------------------------------------- |
-| 400  | 비어 있지 않은 `tools`, 이미지, 지원하지 않는 필드·역할·파라미터 범위                     |
-| 401  | Bearer 인증 누락·불일치. 상류 인증 오류도 전달될 수 있음                                  |
-| 403  | 네이티브 도구 이벤트 거절 또는 상류의 접근 거절                                           |
-| 404  | 잘못된 모델 ID 또는 제공하지 않는 API 경로                                                |
-| 413  | 요청 본문 1MiB 상한 초과                                                                  |
-| 429  | 워커 초과 시 `workers_busy`, `Retry-After: 1`. 상류 제한일 수도 있으므로 오류 코드도 확인 |
-| 502  | CLI 시작·출력·상류 처리 오류. 불완전 응답을 가짜 성공으로 대체하지 않음                   |
-| 504  | 요청 시간 초과                                                                            |
+`/healthz`의 `active`는 처리 중 HTTP 수, `workers.active`는 실행·도구 대기 중 CLI 수, `workers.waitingForTools`는 결과 대기 수입니다. HTTP가 끝나도 외부 도구를 기다리는 CLI는 유지됩니다.
 
-CLI 표준출력은 요청당 2MiB, 단일 SSE 텍스트 파트와 대기 버퍼는 1MiB 상한을 둡니다. 연결 종료·시간 초과 시 자식 프로세스 그룹을 종료하고 요청별 디렉터리를 정리합니다.
+본문은 1MiB, 네이티브 세션 전체 stdout은 2MiB, 개별 함수 인자는 64KiB로 제한합니다. 보류 호출은 최대 64개, 네이티브 세션의 총 호출은 최대 256개입니다. SSE 파트·송신 버퍼는 1MiB 상한입니다. 큰 파일·많은 도구 출력·긴 명령에서는 한도와 TTL을 고려하세요. 대기 TTL을 초과한 결과는 되살리거나 다른 세션에 적용하지 않습니다.
 
-## 보안과 systemd 배포
+| 상태 | 대표 원인                                                                  |
+| ---- | -------------------------------------------------------------------------- |
+| 400  | 잘못된 스키마·호출 이력·미지원 필드·이미지                                 |
+| 401  | Bearer 불일치                                                              |
+| 403  | 네이티브 기본 도구 실행 시도 또는 상류 거절                                |
+| 404  | 잘못된 모델·경로                                                           |
+| 409  | 다른 대화·도구 정의·생성 설정, 중복 결과, 세션 동시 재개                   |
+| 410  | 종료·만료된 도구 세션                                                      |
+| 413  | HTTP 본문 초과                                                             |
+| 429  | HTTP 또는 네이티브 워커 포화; 대기 세션의 정상 재개는 새 CLI를 만들지 않음 |
+| 502  | 상류·MCP·스키마에 맞지 않는 호출·모델의 도구 선택 위반·불완전 응답         |
+| 504  | HTTP 단계 시간 초과                                                        |
 
-### 반드시 지킬 사항
+## 보안과 systemd
 
-- **공개 인터넷에 평문 HTTP로 절대 노출하지 마세요.** 기본 루프백 바인딩을 유지하세요. 원격 접속은 SSH 터널, 접근이 제한된 사설망, 또는 인증·접근 제어를 갖춘 TLS 역방향 프록시를 사용하세요.
-- 서버 자체에는 TLS, 사용자별 계정·할당량, 상세 접근 제어가 없습니다. 하나의 공유 Bearer 토큰이므로 토큰 보유자는 텍스트 요청을 보낼 수 있습니다.
-- 토큰 파일은 `0600`, 상위 비밀 디렉터리는 `0700`으로 관리하세요. 토큰을 출력하거나 커밋하지 말고, curl의 `--verbose`·추적 로그로 인증 헤더가 노출되지 않도록 하세요.
-- 입력은 상류 OpenCode 서비스를 거쳐 처리됩니다. 로컬 서버라고 해서 오프라인 추론이나 비밀 데이터의 로컬 보관을 보장하지 않습니다.
-- 요청별 `HOME` 분리와 CLI의 권한 정책은 OS 수준 샌드박스와 같지 않습니다. 정식 CLI·고정 버전·상류를 신뢰할 수 있는 환경에서 전용 비특권 서비스로 실행하세요.
-- 정상 종료 경로에서는 요청 디렉터리를 지우지만, 강제 종료·전원 장애 뒤에는 흔적이 남을 수 있습니다. 상태·공용 캐시 디렉터리는 민감 데이터로 취급하세요.
+**공개 인터넷에 평문 HTTP로 노출하지 마세요.** 루프백, SSH 터널, 접근 제한 사설망 또는 인증·접근 제어가 있는 TLS 프록시를 사용하세요. 자체 TLS·사용자별 계정·할당량은 없습니다. 하나의 공유 토큰과 호출 ID를 사용하는 서비스이며, 호출 ID는 사용자 인증을 대체하지 않습니다.
 
-### 서비스 설치 예시
+토큰 파일은 `0600`, 비밀 디렉터리는 `0700`으로 관리하고 curl 추적 로그를 켜지 마세요. 입력·함수 정의·결과는 상류 모델로 전달됩니다. HOME/XDG 분리와 권한 설정은 완전한 OS 샌드박스가 아닙니다. 전용 비특권 서비스와 고정 CLI를 사용하세요. 도구 대기 중 민감한 이력·결과가 메모리·네이티브 상태에 남고, 강제 종료 뒤 작업 파일이 남을 수 있습니다. 클라이언트가 호출 응답을 받은 뒤 결과를 보내지 않고 사라지면 TTL까지 자원이 유지됩니다.
 
-[`opencode-cli-gateway.service`](./opencode-cli-gateway.service)는 다음을 전제로 합니다.
-
-- 표준 설치 위치 `/opt/opencode-cli-gateway`, Node.js 실행 파일 `/usr/bin/node`
-- `GATEWAY_HOST=127.0.0.1`, 포트 8940
-- `DynamicUser=yes`, `StateDirectory`·`CacheDirectory`, `UMask=0077`
-- `LoadCredential`로 `/etc/opencode-cli-gateway/token`을 서비스에 전달
-- `ProtectSystem=strict`, `ProtectHome=yes`, `NoNewPrivileges=yes` 등 방어 설정
-- `After=network-online.target`. 특정 VPN이나 운영 호스트에 종속되지 않음
-
-아래는 **신규 설치 예시**입니다. 기존 설치·토큰·서비스 파일을 덮어쓰는 업그레이드 절차가 아닙니다. 저장소에서 `npm install`을 마친 뒤, 실행 중인 서버와 별개로 필요한 런타임 파일만 배치합니다. 토큰은 앞의 로컬 실행 단계에서 생성한 파일을 사용합니다.
+서비스 예제는 `DynamicUser`, `LoadCredential`, `ProtectHome`, `ProtectSystem`, 프로세스 그룹 정리와 2GiB 메모리 상한을 사용합니다. 많은 워커·큰 컨텍스트에서는 메모리 상한과 호스트 여유에 맞춰 동시성을 조정하세요. 아래는 **신규 설치 예시**이며 기존 토큰·설치를 덮어쓰는 업그레이드 절차가 아닙니다.
 
 ```bash
 sudo install -d -m 0755 /opt/opencode-cli-gateway
-sudo install -m 0644 main.mjs server.mjs cli.mjs errors.mjs package.json package-lock.json \
-  /opt/opencode-cli-gateway/
-sudo cp -R node_modules /opt/opencode-cli-gateway/
+sudo install -m 0644 main.mjs server.mjs cli.mjs errors.mjs tools.mjs \
+  tool-bridge.mjs mcp-bridge.mjs package.json package-lock.json /opt/opencode-cli-gateway/
+sudo npm ci --omit=dev --no-audit --no-fund --prefix /opt/opencode-cli-gateway
 sudo install -d -m 0700 /etc/opencode-cli-gateway
 sudo install -m 0600 "$GATEWAY_TOKEN_FILE" /etc/opencode-cli-gateway/token
 sudo install -m 0644 opencode-cli-gateway.service /etc/systemd/system/opencode-cli-gateway.service
@@ -206,182 +160,131 @@ sudo systemctl enable --now opencode-cli-gateway.service
 curl --fail-with-body --silent --show-error http://127.0.0.1:8940/healthz
 ```
 
-로컬 서버가 이미 8940을 사용 중이면 먼저 정상 종료하세요. 서비스 사용자는 설치 디렉터리와 `node_modules`를 읽고 CLI를 실행할 수 있어야 합니다. `/usr/bin/node`가 Node.js 20 이상인지, 배포판의 systemd가 예제의 자격증명·격리 지시문을 지원하는지도 확인하세요. 건강 상태 확인만으로 상류 생성 성공을 판정하지 말고 인증된 Chat 요청도 보내세요.
-
-## 테스트와 작은 벤치마크
-
-### 자동 테스트
+## 검증과 벤치마크
 
 ```bash
 npm test
 python3 -m unittest -v test_public_scripts.py
 ```
 
-Node.js 내장 테스트 러너를 사용합니다. HTTP 검증·인증·SSE·동시성·연결 종료·시간 초과와 CLI 이벤트 처리·권한 설정·작업 공간 정리를 검사합니다. CLI 테스트에는 대체 자식 프로세스를 사용하므로, 이 테스트가 통과해도 실제 무료 모델의 가용성이나 특정 클라이언트의 호환성을 입증하지는 않습니다. 공개 준비 과정에서 `store: false` 수용과 `true`·문자열·`null` 거절 회귀 검증을 포함해 **27개 통과**를 확인했습니다.
+Node 테스트는 HTTP·SSE·세션 소유권·호출 ID·TTL·취소·스키마·정식 MCP SDK 왕복을 검증합니다. 모델 대신 대체 CLI 프로세스를 사용하는 회귀 테스트와 실제 상류 호출 검증을 구분합니다. 현재 Node **48개**, Python **7개** 통과를 확인했습니다.
 
-Python 표준 라이브러리 `unittest` 테스트도 **6개 통과**를 확인했습니다. URL·워커 범위 검증, 등록 토큰의 프로세스 인자·출력 비노출, 비루프백 관리 API 거절, Chat·Responses SSE 벤치 처리, 응답 텍스트 이후의 스트림 오류를 실패로 판정하는 동작을 검사합니다. 로컬 대체 HTTP 서버와 모의 SSH 호출을 사용하므로 실제 원격 등록이나 상류 생성의 성공을 입증하지는 않습니다.
+별도의 실제 모델 검증:
 
-### 직접 재측정
+- 정식 CLI가 MCP 호출을 대기한 뒤, 클라이언트만 알던 무작위 결과를 같은 실행에서 사용해 답변했습니다.
+- 실제 네 세션을 모두 도구 결과 대기로 유지해 `active:4`, `waitingForTools:4`를 확인했습니다. 다섯 번째 요청은 429, 잘못된 교차 결과는 거절됐고, 네 세션 모두 각자의 결과로 완료한 뒤 워커·임시 디렉터리가 0으로 정리됐습니다.
+- GJC 0.18.11에서 `read`를 **클라이언트가 실제 실행**하고 같은 호출 ID로 회신해 최종 파일 내용을 답하는 왕복을 직접 연결 및 OCI 프록시 경유 모두 검증했습니다.
+- 최종 운영본에서도 GJC → OCI → 게이트웨이 → CLI로 **읽기 → 실제 결과 → 쓰기 → 실제 결과 → 최종 답변**을 검증했습니다. 클라이언트 전용 임시 파일의 무작위 본문을 읽어 다른 파일에 기록했고, 두 호출의 ID·성공 결과·실제 파일 내용을 확인했습니다.
+- OCI Responses → 게이트웨이 → CLI 경로의 함수 왕복 **7/7 성공**: 워커 1·2·4의 평균 전체 왕복 시간은 각각 **12.02초·13.01초·12.93초**였습니다. 함수 호출과 실제 결과 회신의 두 HTTP 요청을 포함합니다.
+- 최종 운영본으로 4워커를 다시 측정해 **4/4 추가 성공**, 전체 17.36초·평균 15.39초를 확인했습니다. 두 벤치 합계는 **11/11**, 클라이언트 재시도는 0회입니다.
 
-`benchmark.py`는 Python 표준 라이브러리만 사용합니다. 각 요청의 난수 `nonce`와 1~16의 제곱 배열을 JSON으로 생성하게 하고, 내용과 완료 이벤트를 검사합니다. 자동 클라이언트 재시도는 하지 않습니다.
+소규모 관측이며 장시간 안정성·최대 처리량·다른 장비에서의 성능 보장이 아닙니다. 초기 상류 502 및 기본 도구를 모두 제거한 설정의 403도 관측했습니다. 성공하지 않은 조건을 자동 우회하지 않습니다. 개인 운영정보가 포함된 원본 결과 파일은 공개 저장소에서 제외합니다.
 
-```bash
-python3 benchmark.py \
-  --base-url http://127.0.0.1:8940/v1 \
-  --api chat \
-  --model deepseek-v4.1-flash-free \
-  --key-file "$GATEWAY_TOKEN_FILE" \
-  --workers 1 2 4
-```
+추가 코드 검토 요청에서는 연속 파일 읽기 도중 410, 전체 소스를 제공한 요청에서 502가 관측됐으며 원인은 미확정입니다. 해당 독립 검토는 완료되지 않았습니다. 위의 성공한 짧은 왕복 검증을 장기·대용량 코딩 세션의 안정성 보장으로 해석하지 마세요.
 
-`--key-file` 대신 `GATEWAY_API_KEY`를 환경변수로 전달해도 됩니다. 기본값은 위의 주소·`chat`·모델·워커 배열입니다. 각 배치는 지정한 동시 요청 수만큼 한 번씩 실행됩니다. `--api responses`는 **별도 Responses 프록시의 `/v1` 주소와 그 프록시의 모델 ID·접속 키**를 지정할 때만 사용하세요. 게이트웨이 8940에서 직접 실행하면 404입니다. 결과에는 응답 본문이 포함되므로 공개 전 내용을 검토하세요.
-
-### 관측 결과와 한계
-
-2026-10-15에 기록한 별도 Responses 프록시 → 게이트웨이 Chat Completions → 정식 CLI 경로의 작은 측정입니다. 외부 도구 선언 없는 텍스트 요청을 사용했습니다.
-
-| 동시 요청    | 요청 수 | 내용 검증 성공 | 요청 평균 | 배치 전체 |
-| ------------ | ------- | -------------- | --------- | --------- |
-| 1            | 1       | 1              | 4.920초   | 4.932초   |
-| 2            | 2       | 2              | 6.459초   | 7.060초   |
-| 4            | 4       | 4              | 8.546초   | 8.767초   |
-| 4, 추가 배치 | 4       | 4              | 11.022초  | 16.058초  |
-
-합계 **11/11 성공**입니다. 별도 점검에서 잘못된 토큰 401, 외부 도구 선언 400, 네 워커 사용 중 다섯 번째 요청 429, 연결 종료 후 워커·요청 디렉터리 정리도 관측했습니다. 반면 초기 점검에서는 상류 오류가 502로 전달된 사례도 있었습니다.
-
-이 수치는 장시간 안정성·최대 처리량·동일 성능의 재현을 보장하지 않습니다. 다른 장비·네트워크·상류 혼잡에서는 달라집니다. 특히 **Responses API 텍스트 요청 성공은 공식 Codex CLI의 코딩 모드 성공이 아닙니다.** 개인 운영정보가 들어 있는 원본 측정 파일은 공개 저장소에 포함하지 않습니다.
-
-## 부록 공통: 직접 연결과 프로토콜 프록시
-
-| 클라이언트        | 필요한 프로토콜                | 8940 직접 연결               | 이 문서의 상태                                                                                      |
-| ----------------- | ------------------------------ | ---------------------------- | --------------------------------------------------------------------------------------------------- |
-| Claude Code       | Anthropic Messages             | 불가                         | 별도 프록시 경유 텍스트 실호출에서 400 `unsupported_parameter` 관측. 호환 성공 아님                 |
-| Codex CLI         | OpenAI Responses               | 불가                         | 별도 프록시가 있어도 기본 외부 도구 선언 때문에 일반 코딩 모드 미지원                               |
-| GJC 사용자 공급자 | `openai-completions` 선택 가능 | 도구 없는 텍스트 원샷 실검증 | 0.18.11과 격리 설정에서 응답 본문 `{"gjc_text":true}`, 완료 이유 `stop` 확인. 코딩 모드 검증은 아님 |
-
-여기서 확인한 CLI 도움말 버전은 Claude Code **2.1.292**, Codex CLI **0.153.4**, GJC **0.18.11**입니다. 도움말 확인과 엔드투엔드 성공은 구분합니다. 버전이 바뀌면 요청 필드와 도구 선언을 다시 확인하세요.
-
-### 별도 OpenCodex 프록시를 사용하는 경우
-
-[OpenCodex (`ocx`)](https://github.com/lidge-jun/opencodex)는 별도 프로젝트입니다. Messages·Responses를 Chat Completions로 변환하는 계층으로 사용할 수 있지만, **이 게이트웨이에 도구 실행 기능을 추가해 주지는 않습니다.** 설치·실행·인증은 [OpenCodex 공식 문서](https://opencodex.me/)를 따르세요. OpenCodex의 시작·동기화 작업은 기존 Codex 설정을 변경할 수 있으므로 해당 문서와 적용 대상을 먼저 확인하세요.
-
-프록시 대시보드에 새 사용자 공급자를 등록할 때의 배치는 다음과 같습니다. 기존 공급자나 기본 모델을 대체하지 마세요.
-
-| 위치                              | 설정                                                                                     |
-| --------------------------------- | ---------------------------------------------------------------------------------------- |
-| 프록시의 새 공급자 이름           | 예: `opencode-cli`                                                                       |
-| 상류 어댑터                       | `openai-chat`                                                                            |
-| 상류 기본 URL                     | 프록시와 게이트웨이가 같은 호스트라면 `http://127.0.0.1:8940/v1`                         |
-| 상류 인증                         | `key` 모드. **게이트웨이 토큰**은 프록시의 이 공급자 자격증명 위치에 배치                |
-| 상류 모델                         | 정확히 `deepseek-v4.1-flash-free`                                                        |
-| 클라이언트가 선택하는 프록시 모델 | `opencode-cli/deepseek-v4.1-flash-free`                                                  |
-| Claude Code용 프록시 기본 URL     | `http://127.0.0.1:10100` → `/v1/messages`                                                |
-| Codex용 프록시 기본 URL           | `http://127.0.0.1:10100/v1` → `/responses`                                               |
-| 클라이언트 인증                   | **프록시가 발급·허용한 접속 키**. 게이트웨이 토큰이나 프록시 관리자 토큰과 혼동하지 않음 |
-
-프록시의 모델 입력은 텍스트 전용, 출력 한도는 최대 8192로 맞추세요. 프록시 목록이 도구·이미지 지원을 과대 표시하더라도 실제 게이트웨이의 지원 범위는 바뀌지 않습니다. 주소의 `127.0.0.1`은 **각 프로세스가 실행되는 호스트 자신**입니다. 서로 다른 호스트라면 보호된 연결을 마련해야 하며 공개 평문 URL로 대체해서는 안 됩니다.
-
-선택적으로 `register-oci.py`를 사용하면 SSH 안에서 인증된 OpenCodex 관리 API에 새 공급자를 등록합니다. 특정 클라우드에 종속된 도구는 아니며, 기존 이름의 공급자는 덮어쓰지 않고 기본 모델도 바꾸지 않습니다.
+텍스트 벤치는 `--workload text`이며 기본값입니다. 프록시를 통한 Responses 도구 벤치는 다음처럼 별도 프록시 키와 모델 ID를 사용합니다.
 
 ```bash
-read -r -p '관리 호스트 SSH 별칭: ' HOST
-python3 register-oci.py \
-  --ssh-host "$HOST" \
-  --gateway-base-url http://127.0.0.1:8940/v1 \
-  --token-file "$GATEWAY_TOKEN_FILE" \
-  --name opencode-cli
+(
+  IFS= read -r -s -p '프록시 접속 키: ' GATEWAY_API_KEY
+  printf '\n'
+  export GATEWAY_API_KEY
+  python3 benchmark.py --base-url http://127.0.0.1:10100/v1 \
+    --api responses --workload tools \
+    --model opencode-cli/deepseek-v4.1-flash-free --workers 1 2 4
+)
 ```
 
-이 주소 예시는 **SSH 대상 호스트에서** 게이트웨이 8940에 접근 가능한 경우입니다. `--ssh-host`와 `--gateway-base-url`은 필수입니다. 로컬 `--token-file` 기본값은 `/etc/opencode-cli-gateway/token`, 원격 `--admin-token-file` 기본값은 `~/.opencodex/admin-api-token`, 원격 `--management-url` 기본값은 `http://127.0.0.1:10101`입니다. 관리 URL은 SSH 대상의 루프백만 허용합니다. 이 스크립트는 인증된 관리 API에 실제 설정을 저장하므로 실행 전 대상과 이름을 확인하세요. 관리자 토큰은 원격에서 읽고, 로컬 게이트웨이 토큰은 SSH 표준입력으로 전달하며 값은 출력하지 않습니다.
+## 부록 공통: 프로토콜 프록시
+
+이 서버는 Chat Completions만 제공합니다. [OpenCodex (`ocx`)](https://github.com/lidge-jun/opencodex) 같은 별도 프록시가 Messages·Responses를 변환할 수 있습니다. 프록시가 함수 이름·호출 ID·인자·결과를 보존해야 하며, 초기 요청과 결과 회신은 **같은 게이트웨이 인스턴스**로 라우팅해야 합니다. 재시도·다른 인스턴스 전환으로 보류 세션을 복구할 수 없습니다.
+
+| 위치                     | 값                                                            |
+| ------------------------ | ------------------------------------------------------------- |
+| 공급자 이름 예시         | `opencode-cli`                                                |
+| 상류 어댑터·URL          | `openai-chat`, 같은 호스트면 `http://127.0.0.1:8940/v1`       |
+| 상류 자격증명            | 게이트웨이 토큰, `key` 인증                                   |
+| 상류 모델                | `deepseek-v4.1-flash-free`                                    |
+| 클라이언트용 프록시 모델 | `opencode-cli/deepseek-v4.1-flash-free`                       |
+| Messages 기본 URL        | `http://127.0.0.1:10100`                                      |
+| Responses·Chat 기본 URL  | `http://127.0.0.1:10100/v1`                                   |
+| 클라이언트 키            | **프록시 접속 키**. 게이트웨이 토큰·관리자 키와 혼동하지 않음 |
+
+등록 스크립트는 기존 이름을 덮어쓰거나 기본 공급자를 바꾸지 않습니다. SSH 대상의 관리자 키는 원격에서 읽고 게이트웨이 키는 표준입력으로 전달합니다. 관리 API는 SSH 대상의 루프백만 허용합니다.
+
+```bash
+python3 register-oci.py --ssh-host your-relay \
+  --gateway-base-url http://127.0.0.1:8940/v1 --token-file "$GATEWAY_TOKEN_FILE"
+```
+
+루프백은 각 프로세스의 호스트 자신입니다. 다른 호스트는 보호된 연결을 구성하세요. OpenCodex의 설치·Codex 설정 동기화 동작은 [해당 프로젝트 문서](https://opencodex.me/)를 확인하세요. 모델 목록의 추론된 영상·기능 표기만으로 이 서버의 제한이 바뀌지 않습니다.
 
 ## 부록 A. Claude Code
 
-### 직접 연결 불가, 텍스트 전용 시도도 현재 실패
+Claude Code는 Anthropic Messages를 쓰므로 8940 직접 연결은 불가합니다. 별도 Messages 프록시가 필요하며, 함수 왕복 지원과 특정 Claude Code 버전의 모든 요청 호환성은 다릅니다.
 
-Claude Code는 Anthropic Messages 프로토콜을 사용합니다. `ANTHROPIC_BASE_URL=http://127.0.0.1:8940`으로 지정해도 `/v1/messages`가 없어서 동작하지 않습니다. 앞 절처럼 **별도 Messages → Chat Completions 프록시**가 먼저 필요합니다. Anthropic은 게이트웨이를 통한 비-Claude 모델 사용을 공식 지원하지 않으므로 아래는 독립적인 구성 참고이지 공식 호환 약속이 아닙니다.
-
-**관측한 결과는 실패입니다.** 2.1.292를 격리된 설정 디렉터리에서 실행하고, OpenCodex의 `/v1/messages`에 `--tools ""`, `--strict-mcp-config`, `--disable-slash-commands`, `--setting-sources ""`, `--no-session-persistence`, `--max-turns 1`과 위 프록시 모델을 지정했지만 **400 `unsupported_parameter`**가 발생했습니다. `MAX_THINKING_TOKENS=0`과 `CLAUDE_CODE_MAX_OUTPUT_TOKENS=1024`를 추가해도 동일했고, 게이트웨이가 `store: false`를 수용하도록 수정한 뒤에도 실패했습니다. 이 관측만으로 거절된 정확한 변환 필드를 확정하지는 못했으며, 도구 선언 제거만으로 연결이 성립한다고 볼 수 없습니다.
-
-2.1.292의 `--help`에서 `--tools ""`의 모든 기본 도구 해제, `--strict-mcp-config`, `--mcp-config`, `--disable-slash-commands`는 확인했습니다. 아래는 기본 도구와 MCP를 제외하는 **접속 설정 참고일 뿐, 성공한 사용법이 아닙니다.** 추가 옵션이 포함된 아래 조합 자체도 미검증입니다.
+Claude Code 2.1.292의 이전 텍스트 전용 호출에서는 프록시 경유 400 `unsupported_parameter`를 관측했습니다. 도구 왕복 추가만으로 이 추가 필드 문제가 해결됐다고 주장하지 않습니다. 아래는 **접속 위치를 보여 주는 설정 참고**이며 정식 Claude Code의 코딩 동작을 검증한 명령이 아닙니다.
 
 ```bash
 (
   export ANTHROPIC_BASE_URL=http://127.0.0.1:10100
-  IFS= read -r -s -p '별도 프록시 접속 키: ' ANTHROPIC_AUTH_TOKEN
+  IFS= read -r -s -p '프록시 접속 키: ' ANTHROPIC_AUTH_TOKEN
   printf '\n'
   export ANTHROPIC_AUTH_TOKEN
-  export ENABLE_TOOL_SEARCH=false
   export MAX_THINKING_TOKENS=0
   export CLAUDE_CODE_MAX_OUTPUT_TOKENS=1024
-
-  claude -p \
-    --model opencode-cli/deepseek-v4.1-flash-free \
-    --tools "" \
-    --strict-mcp-config --mcp-config '{"mcpServers":{}}' \
-    --setting-sources "" --disable-slash-commands --no-chrome \
-    --no-session-persistence --max-turns 1 \
-    --system-prompt '파일 접근과 도구 실행 없이 한국어 텍스트로만 답하세요.' \
-    '17의 제곱을 숫자로만 답하세요.'
+  claude -p --model opencode-cli/deepseek-v4.1-flash-free \
+    --tools Read --strict-mcp-config --setting-sources "" \
+    --disable-slash-commands --no-session-persistence --max-turns 3 \
+    'Read 도구로 작업 폴더의 sample.txt를 읽고 내용을 답하세요.'
 )
 ```
 
-기존 관리 설정·플러그인·클라이언트 버전, 프록시의 변환에 따라 추가 필드나 도구가 남을 수 있습니다. 실제 상류 요청이 지원 필드만 사용하는지 확인해야 합니다. 비어 있지 않은 `tools`가 도착하면 400이며, 이미지·파일 첨부·Bash·편집·검색을 쓰는 **일반 코딩 모드는 미지원**입니다. `--allowedTools`나 권한 거절만으로 선언 자체가 사라진다고 가정하지 마세요.
+`--tools Read`는 클라이언트에서 읽기 도구만 제공하는 예시입니다. 편집·셸·MCP 권한은 클라이언트에서 별도로 통제하세요. 추가 요청 필드가 400이면 도구를 텍스트로 숨기거나 무시하지 말고 실제 변환 필드를 확인해야 합니다. 비-Claude 모델을 Claude Code에서 사용하는 공식 지원 약속도 아닙니다.
 
-공식 자료: [Claude Code CLI 옵션](https://code.claude.com/docs/en/cli-reference), [게이트웨이 연결·인증 위치](https://code.claude.com/docs/en/llm-gateway-connect), [게이트웨이 지원 범위](https://code.claude.com/docs/en/llm-gateway), [OpenCodex의 Claude Code 안내](https://opencodex.me/guides/claude-code/).
+공식 자료: [CLI 옵션](https://code.claude.com/docs/en/cli-reference), [게이트웨이](https://code.claude.com/docs/en/llm-gateway).
 
 ## 부록 B. Codex CLI
 
-### 직접 연결 불가, 현재 일반 코딩 모드 미지원
+Codex CLI는 Responses가 필요하므로 별도 프록시를 사용합니다. **일반 Responses 함수 왕복은 실제 검증했지만, Codex CLI 0.153.4 자체의 모든 도구·코딩 동작을 검증한 것은 아닙니다.** custom/freeform·웹 검색 등은 프록시가 지원되는 함수 형태로 변환해야 하며 이 서버가 직접 수용하지 않습니다.
 
-Codex CLI는 Responses 프로토콜을 사용합니다. 게이트웨이 8940의 `/v1/responses`는 404이므로 **별도 Responses → Chat Completions 프록시**가 필요합니다. 하지만 프로토콜 변환만으로 코딩 모드가 지원되지는 않습니다. Codex는 기본적으로 외부 도구를 선언하며, 이를 프록시가 그대로 전달하면 게이트웨이에서 400입니다.
-
-0.153.4의 도움말에서는 `--no-tools` 같은 전체 도구 선언 해제 옵션을 확인하지 못했습니다. `--sandbox read-only`, 승인 설정, MCP 비활성화, 웹 검색 끄기는 **모든 도구 선언 제거와 다릅니다.** 공식 CLI에서 도구를 완전히 빼는 경로를 검증하기 전에는 텍스트 원샷 성공도 주장하지 않습니다.
-
-### 접속 위치를 보여 주는 설정 참고
-
-다음은 실행 성공이 확인된 사용법이 아니라 **프록시 URL·모델·키의 배치 예시**입니다. 기존 `~/.codex/config.toml`을 덮어쓰지 말고 아래 두 섹션만 병합합니다. 같은 이름의 섹션이 이미 있으면 중복 생성하지 말고 해당 항목을 검토해 병합하세요. 루트의 `model`·`model_provider`·기본 프로필 등 기존 기본값은 변경하지 않습니다.
+기존 `~/.codex/config.toml`을 덮어쓰지 말고 다음 두 섹션만 병합하세요. 기존 기본 모델은 바꾸지 않습니다.
 
 ```toml
-[model_providers.ocx-cli-text]
-name = "OpenCodex CLI 텍스트 중계"
+[model_providers.ocx-cli-tools]
+name = "OpenCodex CLI 함수 중계"
 base_url = "http://127.0.0.1:10100/v1"
 wire_api = "responses"
 env_key = "OCX_API_KEY"
 requires_openai_auth = false
 
-[profiles.opencode-cli-text]
+[profiles.opencode-cli-tools]
 model = "opencode-cli/deepseek-v4.1-flash-free"
-model_provider = "ocx-cli-text"
-web_search = "disabled" # 검색만 끄며 전체 도구를 제거하지 않음
+model_provider = "ocx-cli-tools"
+web_search = "disabled"
 ```
-
-아래 `--profile opencode-cli-text`는 위 `[profiles.opencode-cli-text]`를 선택합니다. 별도 이름의 TOML 파일을 자동으로 읽는다고 가정하지 않습니다. 설정을 올바르게 병합해도 기본 외부 도구 선언에 따른 400 문제는 해결되지 않으며, 현재 지원되는 코딩 경로가 아닙니다.
 
 ```bash
 (
-  IFS= read -r -s -p '별도 프록시 접속 키: ' OCX_API_KEY
+  IFS= read -r -s -p '프록시 접속 키: ' OCX_API_KEY
   printf '\n'
   export OCX_API_KEY
-  # 구성 점검용일 뿐입니다. 현재 도구 선언으로 400이 발생할 수 있는 미지원 경로입니다.
-  codex exec --profile opencode-cli-text '17의 제곱을 숫자로만 답하세요.'
+  codex exec --profile opencode-cli-tools --sandbox read-only \
+    '작업 폴더의 sample.txt를 읽고 내용만 답하세요.'
 )
 ```
 
-`env_key`는 **프록시 접속 키의 환경변수 이름**이며, 프록시의 게이트웨이 상류 자격증명과는 별개입니다. `wire_api = "chat"`로 바꾸거나 프롬프트에 “도구 금지”를 붙이는 것으로 지원되지 않는 API·도구 경계를 우회할 수 없습니다. 일반 텍스트 API 호출은 앞의 curl·벤치 예시를 사용하세요. 이번 프로젝트에는 Codex 도구 브리지를 구현하지 않았습니다.
+위 명령은 **미검증 설정 예시**입니다. `read-only`는 클라이언트 파일 변경을 제한하는 설정이지 모든 외부 기능을 격리하는 서버 정책이 아닙니다. 허용하지 않는 요청 필드·도구 종류·인자 형식은 명시적 오류로 처리됩니다.
 
-공식 자료: [Codex CLI 옵션](https://developers.openai.com/codex/cli/reference/), [사용자 공급자·프로필 설정](https://developers.openai.com/codex/config-advanced/), [설정 참조](https://developers.openai.com/codex/config-reference/), [OpenCodex의 Codex 통합 안내](https://opencodex.me/guides/codex-integration/).
+공식 자료: [CLI 옵션](https://developers.openai.com/codex/cli/reference/), [설정](https://developers.openai.com/codex/config-advanced/).
 
-## 부록 C. GJC
+## 부록 C. GJC — 실제 도구 왕복 검증
 
-### 별도 사용자 공급자로 직접 Chat Completions 연결
-
-GJC는 사용자 공급자에 `api: openai-completions`를 지정할 수 있어 **별도 프로토콜 프록시 없이** 8940의 텍스트 API로 구성할 수 있습니다. 기존 내장 `opencode` 등 기본 공급자와 구분하기 위해 여기서는 `opencode-cli-text`라는 새 이름을 사용합니다.
-
-기존 `~/.gjc/agent/models.yml`을 **덮어쓰지 마세요.** 기존 `providers:` 안에 아래 공급자 항목만 병합합니다. `providers:` 루트 키를 중복 생성하거나 기본 모델·역할 바인딩을 바꾸지 마세요. 별도의 `GJC_CODING_AGENT_DIR`을 사용하는 환경에서는 그 디렉터리의 `models.yml`이 대상입니다.
+기존 `~/.gjc/agent/models.yml`의 `providers:`에 아래 항목을 병합하세요. 루트 키를 중복 생성하거나 기존 공급자·역할 바인딩을 덮어쓰지 마세요. `GJC_CODING_AGENT_DIR`을 쓰면 그 디렉터리의 파일이 대상입니다.
 
 ```yaml
 providers:
-  opencode-cli-text:
+  opencode-cli-tools:
     baseUrl: http://127.0.0.1:8940/v1
     apiKeyEnv: GATEWAY_API_KEY
     api: openai-completions
@@ -390,47 +293,37 @@ providers:
       supportsReasoningEffort: false
     models:
       - id: deepseek-v4.1-flash-free
-        name: OpenCode CLI 텍스트 전용
+        name: OpenCode CLI 클라이언트 도구 왕복
         reasoning: false
         input: [text]
-        cost:
-          input: 0
-          output: 0
-          cacheRead: 0
-          cacheWrite: 0
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         contextWindow: 128000
         maxTokens: 8192
 ```
 
-`apiKeyEnv: GATEWAY_API_KEY`는 [GJC 공식 모델 설정 문서](https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/models.md)에 명시된 **환경변수 이름 참조**입니다. YAML에 키 값을 저장하거나 `${...}` 보간 문법을 추측해 넣지 않습니다. `auth: apiKey`는 해결된 토큰을 Bearer 인증으로 사용합니다.
-
-GJC 0.18.11이 보내는 `store: false`는 응답 저장을 요청하지 않는 값이므로 게이트웨이가 수용합니다. 초기에는 이 필드를 거절해 400이 발생했지만, 현재 구현은 `false`만 허용합니다. 저장 활성화나 임의 필드를 허용하도록 지원 범위를 넓힌 것은 아닙니다.
-
-`contextWindow: 128000`은 클라이언트용 설정값이지 128000토큰 입력의 실제 중계 성공을 입증한 수치가 아닙니다. HTTP 본문 상한과 네이티브 프롬프트 부가분도 적용됩니다. 비용 0 역시 현재 무료 모델에 맞춘 표시값이며 상류 정책 변경에 대한 약속이 아닙니다. `reasoning: false`는 클라이언트의 추론 옵션 전송을 막기 위한 설정이지 상류 내부 추론의 부재를 뜻하지 않습니다.
-
-### 도구 없는 텍스트 원샷
-
-**GJC 0.18.11에서 도구 없는 텍스트 원샷을 실제 검증했습니다.** 수정된 게이트웨이와 임시 `GJC_CODING_AGENT_DIR`의 사용자 공급자 설정으로 실행해, 응답 본문 `{"gjc_text":true}`와 완료 이유 `stop`을 확인했습니다. 아래는 같은 텍스트 전용 옵션의 예시입니다. 앞의 토큰 파일을 읽을 수 있고 해당 GJC 설정 디렉터리에 위 공급자를 병합한 환경에서 실행합니다.
+`apiKeyEnv`는 실제 환경변수 이름 참조입니다. YAML에 토큰 값을 저장하거나 `${...}` 보간을 추측하지 않습니다. 비용·컨텍스트 값은 현재 모델과 클라이언트 설정이며 향후 정책·최대 컨텍스트 실측을 보장하지 않습니다. `reasoning: false`는 별도 추론 제어를 전송하지 않는 설정이지 모델 내부 추론이 없다는 뜻이 아닙니다.
 
 ```bash
 (
   IFS= read -r GATEWAY_API_KEY < "$GATEWAY_TOKEN_FILE"
   export GATEWAY_API_KEY
-  gjc --model opencode-cli-text/deepseek-v4.1-flash-free \
-    --no-tools --no-mcp --no-lsp --no-title --no-rules --no-session \
+  gjc --model opencode-cli-tools/deepseek-v4.1-flash-free \
+    --tools read --no-mcp --no-lsp --no-title --no-rules --no-session \
     --thinking off --mode json \
-    -p '설명이나 코드 펜스 없이 {"gjc_text":true}만 출력하세요.'
+    -p 'read 도구로 작업 폴더의 sample.txt를 읽고 내용을 그대로 답하세요.'
 )
 ```
 
-`--no-tools`는 기본 도구, `--no-mcp`는 MCP 자동 로드, `--no-lsp`는 LSP 도구·처리, `--no-title`은 제목 생성 요청, `--no-rules`는 규칙 자동 로드를 끕니다. `--mode json`은 GJC의 출력 모드이지 게이트웨이의 JSON 강제 기능이 아닙니다. 실검증 범위는 이 텍스트 원샷에 한정하며 일반 코딩 모드·도구 실행·장시간 세션 성공을 뜻하지 않습니다. 기본 코딩 세션처럼 실행하거나 별도 확장에서 도구를 주입하면 400이 될 수 있습니다. 이미지·파일을 첨부하지 말고 텍스트만 입력하세요. 잘못된 API 선택으로 Responses나 Messages를 보내도 동작하지 않습니다.
+GJC **0.18.11**에서 임시 파일을 실제로 읽는 도구 호출, `toolUse` 종료, 동일 `toolCallId`의 실제 `toolResult`, 후속 `stop` 답변을 검증했습니다. 직접 연결과 OCI 프록시 경유 모두 성공했습니다. 최종 운영본은 OCI 경유 `--tools read,write`의 다단계 실제 파일 읽기·쓰기도 통과했습니다. 도구는 **GJC 프로세스가 있는 클라이언트**에서 실행됩니다. 텍스트만 필요하면 `--tools read` 대신 `--no-tools`를 쓰세요. `--mode json`은 CLI 출력 형식이지 모델 JSON 강제 기능이 아닙니다.
 
-공식 자료: [Gajae-Code 저장소](https://github.com/Yeachan-Heo/gajae-code), [사용자 공급자·키 참조·호환 필드](https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/models.md).
+OCI 프록시를 쓰려면 별도 공급자의 `baseUrl`을 프록시 `/v1`로, 키를 프록시 키로, 모델 ID를 `opencode-cli/deepseek-v4.1-flash-free`로 바꾸세요. 공급자 이름이 `ocx-cli-tools`라면 선택자는 `ocx-cli-tools/opencode-cli/deepseek-v4.1-flash-free`입니다. 출력 한도 8192와 `openai-completions`를 유지하세요.
+
+공식 자료: [Gajae-Code](https://github.com/Yeachan-Heo/gajae-code), [모델·키·호환 설정](https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/models.md).
 
 ## 상류 문서
 
-- [OpenCode CLI](https://opencode.ai/docs/cli/)
-- [OpenCode 권한 정책](https://opencode.ai/docs/permissions/)
-- [고정한 npm 패키지 `opencode-ai@1.19.0`](https://www.npmjs.com/package/opencode-ai/v/1.19.0)
+- [OpenCode CLI](https://opencode.ai/docs/cli/), [권한](https://opencode.ai/docs/permissions/)
+- [고정 CLI 패키지](https://www.npmjs.com/package/opencode-ai/v/1.19.0)
+- [MCP](https://modelcontextprotocol.io/)
 
-상류 문서는 최신 버전 기준으로 바뀔 수 있습니다. 이 저장소가 고정한 CLI 버전과 실제 요청·오류를 기준으로 지원 범위를 판단하세요.
+상류 문서·서비스는 바뀔 수 있습니다. 고정 버전·실제 요청·실제 오류를 기준으로 지원 범위를 판단하세요.

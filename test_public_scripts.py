@@ -188,6 +188,100 @@ class PublicScriptTests(unittest.TestCase):
         self.assertFalse(result["success"])
         self.assertEqual(result["error"]["message"], "fixture failure")
 
+    def test_tool_roundtrip_preserves_chat_and_responses_call_ids(self):
+        for api in ["chat", "responses"]:
+            seen = []
+
+            def respond(request, timeout):
+                payload = json.loads(request.data)
+                seen.append(payload)
+                call = {
+                    "id": "call_fixture",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": '{"key":"alpha"}'},
+                }
+                if len(seen) == 1:
+                    if api == "chat":
+                        body = {
+                            "choices": [
+                                {
+                                    "finish_reason": "tool_calls",
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": None,
+                                        "tool_calls": [call],
+                                    },
+                                }
+                            ],
+                            "usage": None,
+                        }
+                    else:
+                        body = {
+                            "status": "completed",
+                            "output": [
+                                {
+                                    "type": "function_call",
+                                    "id": "fc_fixture",
+                                    "call_id": call["id"],
+                                    **call["function"],
+                                }
+                            ],
+                            "usage": None,
+                        }
+                else:
+                    history = payload["messages"] if api == "chat" else payload["input"]
+                    result = history[-1]
+                    self.assertEqual(
+                        result["tool_call_id"] if api == "chat" else result["call_id"], call["id"]
+                    )
+                    self.assertEqual(
+                        history[-2]["tool_calls"][0]["id"]
+                        if api == "chat"
+                        else history[-2]["call_id"],
+                        call["id"],
+                    )
+                    actual = json.loads(result["content"] if api == "chat" else result["output"])[
+                        "value"
+                    ]
+                    if api == "chat":
+                        body = {
+                            "choices": [
+                                {
+                                    "finish_reason": "stop",
+                                    "message": {"role": "assistant", "content": actual},
+                                }
+                            ],
+                            "usage": {"total_tokens": 22},
+                        }
+                    else:
+                        body = {
+                            "status": "completed",
+                            "output": [
+                                {
+                                    "type": "message",
+                                    "content": [{"type": "output_text", "text": actual}],
+                                }
+                            ],
+                            "usage": {"total_tokens": 22},
+                        }
+                response = io.BytesIO(json.dumps(body).encode())
+                response.status = 200
+                return response
+
+            with patch.object(benchmark.urllib.request, "urlopen", side_effect=respond):
+                result = benchmark.call_tools(
+                    0,
+                    threading.Barrier(1),
+                    base_url="http://127.0.0.1:8940/v1",
+                    model="fixture",
+                    api=api,
+                    key=secrets.token_urlsafe(32),
+                    timeout=5,
+                )
+            self.assertTrue(result["success"], result)
+            self.assertEqual(result["tool_calls"], 1)
+            self.assertEqual(result["http_requests"], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

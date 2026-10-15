@@ -1,5 +1,5 @@
 [Unit]
-Description=Official OpenCode CLI text gateway
+Description=Official OpenCode CLI caller-tool gateway
 Wants=network-online.target
 After=network-online.target
 
@@ -12,6 +12,7 @@ Environment=GATEWAY_HOST=127.0.0.1
 Environment=GATEWAY_PORT=8940
 Environment=GATEWAY_WORKERS=4
 Environment=GATEWAY_TIMEOUT_MS=120000
+Environment=GATEWAY_TOOL_TTL_MS=300000
 Environment=GATEWAY_STATE_DIR=/var/lib/opencode-cli-gateway
 Environment=GATEWAY_CACHE_DIR=/var/cache/opencode-cli-gateway
 Environment=GATEWAY_TOKEN_FILE=%d/token

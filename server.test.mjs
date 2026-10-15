@@ -219,7 +219,7 @@ test(
     assert.equal(models.data.length, 1);
     assert.equal(models.data[0].id, MODEL);
     assert.equal(models.data[0].object, "model");
-    assert.equal(models.data[0].supports_tool_use, false);
+    assert.equal(models.data[0].supports_tool_use, true);
     assert.equal(models.data[0].supports_vision, false);
     assert.match(models.data[0].metadata.system_message_semantics, /대화 기록/);
     const missing = await chat(server, input({ model: "다른-모델" }));
@@ -343,6 +343,9 @@ test(
         { role: "assistant", content: "이전 응답" },
       ],
       maxOutputTokens: 8192,
+      tools: [],
+      toolChoice: "auto",
+      parallelToolCalls: false,
       temperature: 0,
       topP: 1,
     });
@@ -428,7 +431,10 @@ test(
           ],
         },
       ],
-      ["도구 선언", { tools: [{ type: "function", function: { name: "f" } }] }],
+      [
+        "비함수 도구 선언",
+        { tools: [{ type: "custom", function: { name: "f" } }] },
+      ],
       ["도구 타입", { tools: {} }],
       ["도구 null", { tools: null }],
       ["필수 도구", { tool_choice: "required" }],
@@ -437,7 +443,6 @@ test(
         { tool_choice: { type: "function", function: { name: "f" } } },
       ],
       ["도구 선택 null", { tool_choice: null }],
-      ["병렬 도구", { parallel_tool_calls: true }],
       ["병렬 도구 타입", { parallel_tool_calls: null }],
       ["응답 저장", { store: true }],
       ["응답 저장 타입", { store: "false" }],
@@ -889,3 +894,144 @@ test(
     await waitActive(server, 0);
   },
 );
+
+test("외부 함수 응답은 이름·ID·JSON 인자를 보존하고 전송 완료 뒤에만 대기를 확정한다", async (t) => {
+  const tool = {
+    type: "function",
+    function: {
+      name: "lookup",
+      parameters: {
+        type: "object",
+        properties: { key: { type: "string" } },
+        required: ["key"],
+      },
+    },
+  };
+  const call = {
+    id: "call_gw_fixture",
+    type: "function",
+    function: { name: "lookup", arguments: '{"key":"alpha"}' },
+  };
+  let committed = 0;
+  const server = await fixture(t, {
+    run: async (normalized) => {
+      assert.equal(normalized.tools[0].function.name, "lookup");
+      assert.deepEqual(normalized.toolChoice, {
+        type: "function",
+        function: { name: "lookup" },
+      });
+      return {
+        text: "",
+        toolCalls: [call],
+        finishReason: "tool_calls",
+        usage: null,
+        commit: () => {
+          committed++;
+        },
+        cancel: async () => assert.fail("정상 응답은 취소하지 않음"),
+      };
+    },
+  });
+  const response = await chat(
+    server,
+    input({
+      tools: [tool],
+      tool_choice: { type: "function", function: { name: "lookup" } },
+      parallel_tool_calls: true,
+    }),
+  );
+  assert.equal(response.status, 200);
+  assert.equal(json(response).choices[0].finish_reason, "tool_calls");
+  assert.deepEqual(json(response).choices[0].message, {
+    role: "assistant",
+    content: null,
+    tool_calls: [call],
+  });
+  assert.equal(json(response).usage, null);
+  assert.equal(committed, 1);
+});
+
+test("SSE 함수 호출은 안정된 index와 ID를 내보내고 tool_calls로 종료한다", async (t) => {
+  const calls = ["one", "two"].map((name, index) => ({
+    id: "call_" + index,
+    type: "function",
+    function: { name, arguments: '{"value":3}' },
+  }));
+  let committed = false;
+  const server = await fixture(t, {
+    run: async () => ({
+      text: "",
+      toolCalls: calls,
+      finishReason: "tool_calls",
+      usage: null,
+      commit: () => {
+        committed = true;
+      },
+      cancel: async () => {},
+    }),
+  });
+  const response = await chat(
+    server,
+    input({ stream: true, stream_options: { include_usage: true } }),
+  );
+  const frames = events(response)
+    .filter((frame) => frame.data !== "[DONE]")
+    .map((frame) => frame.data);
+  const emitted = frames.flatMap((frame) =>
+    frame.choices.flatMap((choice) => choice.delta?.tool_calls ?? []),
+  );
+  assert.deepEqual(
+    emitted,
+    calls.map((call, index) => ({ index, ...call })),
+  );
+  assert.equal(
+    frames.find((frame) => frame.choices[0]?.finish_reason)?.choices[0]
+      .finish_reason,
+    "tool_calls",
+  );
+  assert.equal(committed, true);
+});
+
+test("호출 이력과 실제 도구 결과는 tool_call_id로 검증하고 runner에 전달한다", async (t) => {
+  const call = {
+    id: "call_result",
+    type: "function",
+    function: { name: "lookup", arguments: "{}" },
+  };
+  let received;
+  const server = await fixture(t, {
+    run: async (request) => {
+      received = request.messages;
+      return result("actual");
+    },
+  });
+  const messages = [
+    { role: "user", content: "조회" },
+    { role: "assistant", content: null, tool_calls: [call] },
+    {
+      role: "tool",
+      tool_call_id: call.id,
+      content: [{ type: "text", text: "actual" }],
+    },
+  ];
+  assert.equal((await chat(server, input({ messages }))).status, 200);
+  assert.deepEqual(received[1], {
+    role: "assistant",
+    content: "",
+    tool_calls: [call],
+  });
+  assert.deepEqual(received[2], {
+    role: "tool",
+    tool_call_id: call.id,
+    content: "actual",
+  });
+  for (const invalid of [
+    messages.slice(0, -1),
+    [...messages, messages[2]],
+    [...messages.slice(0, -1), { ...messages[2], tool_call_id: "other" }],
+  ])
+    assert.equal(
+      (await chat(server, input({ messages: invalid }))).status,
+      400,
+    );
+});

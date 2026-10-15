@@ -74,9 +74,7 @@ def registration(name, gateway_url, token):
             "defaultMaxOutputTokens": 8192,
             "modelMaxOutputTokens": {MODEL: 8192},
             "modelCapabilities": {MODEL: {"inputModalities": ["text"]}},
-            "modelDisplayNames": {
-                MODEL: "DeepSeek V4.1 Flash Free · CLI 텍스트 전용 · 도구 미지원"
-            },
+            "modelDisplayNames": {MODEL: "DeepSeek V4.1 Flash Free · CLI 클라이언트 도구 왕복"},
         },
     }
 
