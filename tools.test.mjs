@@ -5,9 +5,7 @@ import {
   normalizeToolChoice,
   normalizeHistoryCalls,
   validateHistory,
-  compileParameters,
   stableJson,
-  mcpToolSchema,
 } from "./tools.mjs";
 
 const tool = {
@@ -28,12 +26,8 @@ const call = {
   function: { name: "lookup", arguments: '{"key":"alpha"}' },
 };
 
-test("실제 함수 인자는 선언 스키마로 검증하고 이름·정의·초안 오류를 거절한다", () => {
-  const normalized = normalizeTools([tool]);
-  const validate = compileParameters(normalized[0].function.parameters);
-  assert.equal(validate({ key: "alpha" }), true);
-  assert.equal(validate({ key: 3 }), false);
-  assert.equal(validate({ key: "alpha", extra: true }), false);
+test("함수 정의는 원래 스키마를 그대로 보존하고 이름·정의·초안 오류를 거절한다", () => {
+  assert.deepEqual(normalizeTools([tool]), [tool]);
   for (const tools of [
     null,
     {},
@@ -71,7 +65,7 @@ test("실제 함수 인자는 선언 스키마로 검증하고 이름·정의·�
   }
 });
 
-test("draft-07와 2020-12 및 로컬 참조를 검증하고 사용자 스키마 ID를 전역 캐시에 남기지 않는다", () => {
+test("draft-07와 2020-12 및 로컬 참조를 허용하고 사용자 스키마 ID를 전역 캐시에 남기지 않는다", () => {
   for (const $schema of [
     "http://json-schema.org/draft-07/schema#",
     "https://json-schema.org/draft/2020-12/schema",
@@ -85,9 +79,16 @@ test("draft-07와 2020-12 및 로컬 참조를 검증하고 사용자 스키마 
       required: ["value"],
     };
     for (let i = 0; i < 3; i++) {
-      const validate = compileParameters(structuredClone(parameters));
-      assert.equal(validate({ value: 4 }), true);
-      assert.equal(validate({ value: 1 }), false);
+      const [normalized] = normalizeTools([
+        {
+          type: "function",
+          function: {
+            name: "fixture",
+            parameters: structuredClone(parameters),
+          },
+        },
+      ]);
+      assert.deepEqual(normalized.function.parameters, parameters);
     }
   }
 });
@@ -157,23 +158,4 @@ test("대화 비교는 JSON 객체 키 순서에 의존하지 않는다", () => 
     () => stableJson({ a: Infinity }),
     (error) => error.status === 400,
   );
-});
-
-test("MCP 포장은 원래 추가 속성·로컬 참조·리터럴 데이터를 바꾸지 않는다", () => {
-  const schema = {
-    type: "object",
-    $defs: { number: { type: "number" } },
-    additionalProperties: { $ref: "#/$defs/number" },
-    minProperties: 1,
-  };
-  const validate = compileParameters(mcpToolSchema(schema));
-  assert.equal(validate({ arguments: { arbitrary: 3 } }), true);
-  assert.equal(validate({ arguments: { arbitrary: "wrong" } }), false);
-  assert.equal(validate({ arguments: {} }), false);
-  assert.equal(validate({ arguments: { arbitrary: 3 }, extra: 1 }), false);
-  const literal = {
-    type: "object",
-    properties: { data: { const: { $ref: "literal-data" } } },
-  };
-  assert.deepEqual(mcpToolSchema(literal).properties.arguments, literal);
 });

@@ -13,6 +13,11 @@ const MAX_STREAM_BUFFER_BYTES = 1024 * 1024;
 const ROLES = new Set(["system", "developer", "user", "assistant", "tool"]);
 const TEXT_PART_TYPES = new Set(["text", "input_text", "output_text"]);
 const TEXT_PART_FIELDS = new Set(["type", "text"]);
+const IMAGE_PART_FIELDS = new Set(["type", "image_url"]);
+const IMAGE_URL_FIELDS = new Set(["url", "detail"]);
+const IMAGE_DATA =
+  /^data:(image\/(?:png|jpeg|gif|webp));base64,[A-Za-z0-9+/]+={0,2}$/;
+const REASONING_EFFORTS = new Set(["low", "high", "max"]);
 const STREAM_FIELDS = new Set(["include_usage"]);
 const REQUEST_FIELDS = new Set([
   "model",
@@ -28,16 +33,23 @@ const REQUEST_FIELDS = new Set([
   "tool_choice",
   "parallel_tool_calls",
   "n",
+  "stop",
+  "seed",
+  "frequency_penalty",
+  "presence_penalty",
+  "reasoning_effort",
+  "response_format",
+  "user",
 ]);
 const METADATA = Object.freeze({
-  gateway: "opencode-cli-caller-tool-relay",
-  system_message_semantics:
-    "system·developer 메시지는 네이티브 OpenCode 에이전트에게 전달되는 대화 기록이며 에이전트의 시스템 지시를 대체하지 않습니다.",
-  streaming: "completed_text_parts",
+  gateway: "opencode-cli-stateless",
+  request_semantics:
+    "Each request is one model step of the official OpenCode CLI. Caller system/developer text, message roles, tool calls, tool results and function definitions replace OpenCode's own prompt, history and tools.",
   supports_tool_use: true,
   tool_execution: "caller_owned",
-  tool_continuation: "live_native_session",
-  supports_vision: false,
+  tool_continuation: "stateless_history",
+  streaming: "token_deltas",
+  supports_vision: true,
 });
 
 function invalid(message, code = "invalid_request") {
@@ -62,8 +74,8 @@ function onlyFields(object, fields, label) {
 }
 
 function tokenLimit(value, label) {
-  if (!Number.isInteger(value) || value < 1 || value > 8192) {
-    throw invalid(`${label}은 1부터 8192 사이의 정수여야 합니다.`);
+  if (!Number.isInteger(value) || value < 1 || value > 32000) {
+    throw invalid(`${label}은 1부터 32000 사이의 정수여야 합니다.`);
   }
   return value;
 }
@@ -87,13 +99,20 @@ function normalizeMessage(message) {
   const fields = new Set([
     "role",
     "content",
-    ...(message.role === "assistant" ? ["tool_calls"] : []),
+    ...(message.role === "assistant"
+      ? ["tool_calls", "reasoning_content"]
+      : []),
     ...(message.role === "tool" ? ["tool_call_id", "name"] : []),
   ]);
   onlyFields(message, fields, "메시지");
   const result = { role: message.role };
   if (message.role === "assistant" && has(message, "tool_calls"))
     result.tool_calls = normalizeHistoryCalls(message.tool_calls);
+  if (message.role === "assistant" && has(message, "reasoning_content")) {
+    if (typeof message.reasoning_content !== "string")
+      throw invalid("reasoning_content는 문자열이어야 합니다.");
+    result.reasoning_content = message.reasoning_content;
+  }
   if (message.role === "tool") {
     if (
       typeof message.tool_call_id !== "string" ||
@@ -108,7 +127,9 @@ function normalizeMessage(message) {
     }
   }
   if (typeof message.content === "string")
-    return { ...result, content: message.content };
+    return withParts({ ...result, content: message.content }, [
+      { type: "text", text: message.content },
+    ]);
   if (
     message.role === "assistant" &&
     result.tool_calls &&
@@ -116,25 +137,63 @@ function normalizeMessage(message) {
   )
     return { ...result, content: "" };
   if (!Array.isArray(message.content)) {
-    throw invalid("메시지 내용은 문자열 또는 텍스트 파트 배열이어야 합니다.");
+    throw invalid("메시지 내용은 문자열 또는 콘텐츠 파트 배열이어야 합니다.");
   }
-  const content = message.content
-    .map((part) => {
-      if (
-        !isObject(part) ||
-        !TEXT_PART_TYPES.has(part.type) ||
-        typeof part.text !== "string"
-      ) {
+  const parts = message.content.map((part) => {
+    if (
+      isObject(part) &&
+      TEXT_PART_TYPES.has(part.type) &&
+      typeof part.text === "string"
+    ) {
+      onlyFields(part, TEXT_PART_FIELDS, "텍스트 파트");
+      return { type: "text", text: part.text };
+    }
+    if (
+      message.role === "user" &&
+      isObject(part) &&
+      part.type === "image_url" &&
+      isObject(part.image_url)
+    ) {
+      onlyFields(part, IMAGE_PART_FIELDS, "이미지 파트");
+      onlyFields(part.image_url, IMAGE_URL_FIELDS, "image_url");
+      const match =
+        typeof part.image_url.url === "string"
+          ? IMAGE_DATA.exec(part.image_url.url)
+          : null;
+      if (!match)
         throw invalid(
-          "메시지 내용은 텍스트 파트만 허용합니다.",
+          "이미지는 PNG·JPEG·GIF·WebP base64 data URL만 허용합니다.",
           "unsupported_content",
         );
-      }
-      onlyFields(part, TEXT_PART_FIELDS, "텍스트 파트");
-      return part.text;
-    })
+      if (
+        part.image_url.detail !== undefined &&
+        !["auto", "low", "high"].includes(part.image_url.detail)
+      )
+        throw invalid("image_url.detail 값이 잘못되었습니다.");
+      return {
+        type: "file",
+        mime: match[1],
+        url: part.image_url.url,
+        filename: "image",
+      };
+    }
+    throw invalid(
+      message.role === "user"
+        ? "사용자 메시지는 텍스트와 이미지 파트만 허용합니다."
+        : "이 역할의 메시지는 텍스트 파트만 허용합니다.",
+      "unsupported_content",
+    );
+  });
+  const content = parts
+    .filter((part) => part.type === "text")
+    .map((part) => part.text)
     .join("");
-  return { ...result, content };
+  return withParts({ ...result, content }, parts);
+}
+
+// Only user messages carry structured parts; other roles are plain text.
+function withParts(message, parts) {
+  return message.role === "user" ? { ...message, parts } : message;
 }
 
 function normalizeRequest(body, modelId) {
@@ -207,10 +266,79 @@ function normalizeRequest(body, modelId) {
     parallelToolCalls: body.parallel_tool_calls ?? true,
   };
   validateHistory(normalized.messages);
+  if (
+    normalized.messages
+      .slice(
+        normalized.messages.findIndex(
+          (m) => !["system", "developer"].includes(m.role),
+        ),
+      )
+      .some((m) => ["system", "developer"].includes(m.role))
+  )
+    throw invalid(
+      "system·developer 메시지는 대화 앞부분에만 둘 수 있습니다.",
+      "unsupported_parameter",
+    );
+  if (!normalized.messages.some((m) => m.role === "user"))
+    throw invalid("적어도 하나의 user 메시지가 필요합니다.");
+  normalized.options = extraOptions(body);
   if (has(body, "temperature"))
     normalized.temperature = sampling(body.temperature, 0, 2, "temperature");
   if (has(body, "top_p")) normalized.topP = sampling(body.top_p, 0, 1, "top_p");
   return { normalized, stream, includeUsage };
+}
+
+// Chat Completions fields OpenCode's openai-compatible provider forwards
+// verbatim through providerOptions; they reach the upstream request body.
+function extraOptions(body) {
+  const options = {};
+  if (has(body, "stop")) {
+    const stop = typeof body.stop === "string" ? [body.stop] : body.stop;
+    if (
+      !Array.isArray(stop) ||
+      stop.length < 1 ||
+      stop.length > 4 ||
+      stop.some((item) => typeof item !== "string" || !item)
+    )
+      throw invalid("stop은 비어 있지 않은 문자열 1~4개여야 합니다.");
+    options.stop = stop;
+  }
+  if (has(body, "seed")) {
+    if (!Number.isSafeInteger(body.seed))
+      throw invalid("seed는 정수여야 합니다.");
+    options.seed = body.seed;
+  }
+  for (const key of ["frequency_penalty", "presence_penalty"])
+    if (has(body, key)) options[key] = sampling(body[key], -2, 2, key);
+  if (has(body, "reasoning_effort")) {
+    if (!REASONING_EFFORTS.has(body.reasoning_effort))
+      throw invalid("reasoning_effort는 low·high·max 중 하나여야 합니다.");
+    options.reasoning_effort = body.reasoning_effort;
+  }
+  if (has(body, "user")) {
+    if (typeof body.user !== "string" || body.user.length > 256)
+      throw invalid("user는 256자 이하 문자열이어야 합니다.");
+    options.user = body.user;
+  }
+  if (has(body, "response_format")) {
+    const format = body.response_format;
+    if (
+      !isObject(format) ||
+      !["text", "json_object", "json_schema"].includes(format.type)
+    )
+      throw invalid("response_format 형식이 잘못되었습니다.");
+    if (format.type === "json_schema") {
+      const schema = format.json_schema;
+      if (
+        !isObject(schema) ||
+        typeof schema.name !== "string" ||
+        (schema.schema !== undefined && !isObject(schema.schema))
+      )
+        throw invalid("response_format.json_schema 형식이 잘못되었습니다.");
+    }
+    options.response_format = format;
+  }
+  return options;
 }
 
 function readJson(req, maxBodyBytes, signal) {
@@ -325,7 +453,9 @@ function checkResult(result) {
   if (
     !isObject(result) ||
     typeof result.text !== "string" ||
-    !["stop", "length", "tool_calls"].includes(result.finishReason)
+    !["stop", "length", "tool_calls", "content_filter"].includes(
+      result.finishReason,
+    )
   ) {
     throw new GatewayError(
       502,
@@ -333,32 +463,14 @@ function checkResult(result) {
       "네이티브 실행 결과 형식이 잘못되었습니다.",
     );
   }
-  if (result.finishReason === "tool_calls") {
-    try {
-      normalizeHistoryCalls(result.toolCalls);
-    } catch {
-      throw new GatewayError(
-        502,
-        "invalid_runner_result",
-        "네이티브 함수 호출 응답이 잘못되었습니다.",
-      );
-    }
-    if (
-      typeof result.commit !== "function" ||
-      typeof result.cancel !== "function"
-    )
-      throw new GatewayError(
-        502,
-        "invalid_runner_result",
-        "도구 호출 응답의 수명 제어가 없습니다.",
-      );
-  } else if (result.toolCalls?.length)
+  const calls = result.toolCalls ?? [];
+  if ((result.finishReason === "tool_calls") !== calls.length > 0)
     throw new GatewayError(
       502,
       "invalid_runner_result",
       "함수 호출과 종료 이유가 일치하지 않습니다.",
     );
-  if (result.usage === null && result.finishReason === "tool_calls") return;
+  if (calls.length) normalizeHistoryCalls(calls);
   if (
     !isObject(result.usage) ||
     ["prompt_tokens", "completion_tokens", "total_tokens"].some(
@@ -430,15 +542,6 @@ export function createGateway({
     let stream = false;
     let includeUsage = false;
     let streamStarted = false;
-    let turnResult;
-    let responseDone;
-    const responseComplete = new Promise((resolve) => {
-      responseDone = resolve;
-    });
-    const onFinished = () => {
-      turnResult?.commit?.();
-      responseDone();
-    };
     const abort = (reason) => {
       if (!signal.aborted) controller.abort(reason);
     };
@@ -453,7 +556,6 @@ export function createGateway({
           "클라이언트 연결이 종료되었습니다.",
         ),
       );
-      responseDone();
     };
     const writable = () =>
       !terminal && !disconnected && !res.destroyed && !res.writableEnded;
@@ -556,7 +658,6 @@ export function createGateway({
     req.once("error", onDisconnected);
     res.once("close", onDisconnected);
     res.once("error", onDisconnected);
-    res.once("finish", onFinished);
     try {
       const parsed = normalizeRequest(
         await readJson(req, maxBodyBytes, signal),
@@ -573,13 +674,13 @@ export function createGateway({
       }
       active += 1;
       admitted = true;
-      const onText = (text) => {
+      const delta = (field) => (text) => {
         signal.throwIfAborted();
         if (typeof text !== "string") {
           throw new GatewayError(
             502,
             "invalid_runner_result",
-            "네이티브 텍스트 파트 형식이 잘못되었습니다.",
+            "네이티브 델타 형식이 잘못되었습니다.",
           );
         }
         if (!stream || text.length === 0) return;
@@ -587,22 +688,28 @@ export function createGateway({
           const error = new GatewayError(
             502,
             "stream_backpressure",
-            "스트림 텍스트 파트 크기 상한을 초과했습니다.",
+            "스트림 델타 크기 상한을 초과했습니다.",
           );
           abort(error);
           throw error;
         }
         beginStream();
         writeEvent(
-          chunk([{ index: 0, delta: { content: text }, finish_reason: null }]),
+          chunk([{ index: 0, delta: { [field]: text }, finish_reason: null }]),
         );
       };
-      const result = await run(parsed.normalized, { signal, onText });
-      turnResult = result;
+      const onText = delta("content");
+      const onReasoning = delta("reasoning_content");
+      const result = await run(parsed.normalized, {
+        signal,
+        onText,
+        onReasoning,
+      });
       signal.throwIfAborted();
       if (!writable()) return;
       checkResult(result);
       if (stream) {
+        // Runners that report no deltas still deliver their final text once.
         if (!streamStarted && result.text.length > 0) onText(result.text);
         beginStream();
         for (const [index, call] of (result.toolCalls ?? []).entries()) {
@@ -636,6 +743,9 @@ export function createGateway({
               message: {
                 role: "assistant",
                 content: result.text || (result.toolCalls?.length ? null : ""),
+                ...(result.reasoning
+                  ? { reasoning_content: result.reasoning }
+                  : {}),
                 ...(result.toolCalls?.length
                   ? { tool_calls: result.toolCalls }
                   : {}),
@@ -648,16 +758,13 @@ export function createGateway({
         });
       }
     } catch (error) {
-      await turnResult?.cancel?.();
       sendFailure(error);
     } finally {
-      await responseComplete;
       clearTimeout(timer);
       req.off("aborted", onDisconnected);
       req.off("error", onDisconnected);
       res.off("close", onDisconnected);
       res.off("error", onDisconnected);
-      res.off("finish", onFinished);
       if (admitted) active -= 1;
     }
   }
@@ -739,11 +846,11 @@ export function createGateway({
               created: modelCreated,
               owned_by: "opencode-cli-gateway",
               supports_tool_use: true,
-              supports_vision: false,
-              context_window: 128000,
-              context_length: 128000,
-              max_output_tokens: 8192,
-              input_modalities: ["text"],
+              supports_vision: true,
+              context_window: 200000,
+              context_length: 200000,
+              max_output_tokens: 32000,
+              input_modalities: ["text", "image"],
               metadata: METADATA,
             },
           ],

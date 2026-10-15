@@ -25,7 +25,9 @@ def api_url(value):
             raise ValueError()
         parsed.port
     except ValueError as error:
-        raise argparse.ArgumentTypeError("자격증명·쿼리 없는 HTTP(S) URL이 필요합니다.") from error
+        raise argparse.ArgumentTypeError(
+            "자격증명·쿼리 없는 HTTP(S) URL이 필요합니다."
+        ) from error
     return value.rstrip("/")
 
 
@@ -43,7 +45,9 @@ def call(index, barrier, *, base_url, model, api, key, timeout):
     payload = {"model": model, "stream": True}
     if api == "chat":
         path = "/chat/completions"
-        payload.update(messages=messages, max_tokens=1024, stream_options={"include_usage": True})
+        payload.update(
+            messages=messages, max_tokens=1024, stream_options={"include_usage": True}
+        )
     else:
         path = "/responses"
         payload.update(input=messages, max_output_tokens=1024)
@@ -88,7 +92,9 @@ def call(index, barrier, *, base_url, model, api, key, timeout):
                     kind = event.get("type")
                     if kind == "response.output_text.delta":
                         if record["first_visible_text_s"] is None:
-                            record["first_visible_text_s"] = round(time.monotonic() - started, 3)
+                            record["first_visible_text_s"] = round(
+                                time.monotonic() - started, 3
+                            )
                         record["text"] += event.get("delta", "")
                     if kind == "response.completed":
                         native = event.get("response", {})
@@ -96,7 +102,9 @@ def call(index, barrier, *, base_url, model, api, key, timeout):
                         record["usage"] = native.get("usage", {})
                 if "error" in event or event.get("type") == "response.failed":
                     completed = False
-                    record["error"] = event.get("error", event.get("response", {}).get("error"))
+                    record["error"] = event.get(
+                        "error", event.get("response", {}).get("error")
+                    )
                     break
         try:
             record["success"] = completed and json.loads(record["text"]) == {
@@ -118,21 +126,25 @@ def call(index, barrier, *, base_url, model, api, key, timeout):
 
 
 def call_tools(index, barrier, *, base_url, model, api, key, timeout):
-    """모델이 미리 알 수 없는 결과를 클라이언트 함수에서 생성해 같은 호출로 회신한다."""
+    """모델이 미리 알 수 없는 파일 내용을 클라이언트 함수에서 생성해 다음 요청 이력으로 회신한다.
+
+    코딩 에이전트처럼 `read` 함수를 선언한다. OpenCode 무료 상류는 `read`가 없는
+    함수 목록을 403으로 거절한다.
+    """
     function = {
-        "name": "lookup",
-        "description": "외부 클라이언트 값 조회",
+        "name": "read",
+        "description": "클라이언트 작업 공간의 파일 내용을 읽는다.",
         "parameters": {
             "type": "object",
-            "properties": {"key": {"type": "string"}},
-            "required": ["key"],
+            "properties": {"path": {"type": "string"}},
+            "required": ["path"],
             "additionalProperties": False,
         },
     }
     history = [
         {
             "role": "user",
-            "content": 'lookup(key="alpha")를 반드시 호출하고 실제 반환된 value 문자열만 그대로 답하세요. 값을 추측하지 마세요.',
+            "content": "read 함수로 value.txt를 반드시 읽고 파일에 실제로 들어 있는 문자열만 그대로 답하세요. 값을 추측하지 마세요.",
         }
     ]
     record = {
@@ -160,12 +172,17 @@ def call_tools(index, barrier, *, base_url, model, api, key, timeout):
             else:
                 path = "/responses"
                 payload.update(
-                    input=history, tools=[{"type": "function", **function}], max_output_tokens=1024
+                    input=history,
+                    tools=[{"type": "function", **function}],
+                    max_output_tokens=1024,
                 )
             request = urllib.request.Request(
                 base_url + path,
                 data=json.dumps(payload, ensure_ascii=False).encode(),
-                headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"},
+                headers={
+                    "Authorization": "Bearer " + key,
+                    "Content-Type": "application/json",
+                },
             )
             record["http_requests"] += 1
             with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -182,7 +199,10 @@ def call_tools(index, barrier, *, base_url, model, api, key, timeout):
                 calls = [
                     {
                         "id": item["call_id"],
-                        "function": {"name": item["name"], "arguments": item["arguments"]},
+                        "function": {
+                            "name": item["name"],
+                            "arguments": item["arguments"],
+                        },
                     }
                     for item in output
                     if item.get("type") == "function_call"
@@ -197,8 +217,13 @@ def call_tools(index, barrier, *, base_url, model, api, key, timeout):
             if not calls:
                 record["text"] = text
                 record["usage"] = result.get("usage")
+                # The value is random per run, so containing it proves the
+                # answer came from the client's real function result.
                 record["success"] = (
-                    completed and record["tool_calls"] > 0 and text.strip() == actual
+                    completed
+                    and record["tool_calls"] > 0
+                    and actual is not None
+                    and actual in text
                 )
                 break
             if actual is None:
@@ -206,14 +231,20 @@ def call_tools(index, barrier, *, base_url, model, api, key, timeout):
             history.extend([message] if api == "chat" else output)
             for call in calls:
                 fn = call["function"]
-                if fn["name"] != "lookup" or json.loads(fn["arguments"]) != {"key": "alpha"}:
+                if fn["name"] != "read" or json.loads(fn["arguments"]) != {
+                    "path": "value.txt"
+                }:
                     raise ValueError("함수 이름 또는 인자가 선언과 다릅니다.")
                 record["tool_calls"] += 1
-                content = json.dumps({"value": actual})
+                content = actual
                 history.append(
                     {"role": "tool", "tool_call_id": call["id"], "content": content}
                     if api == "chat"
-                    else {"type": "function_call_output", "call_id": call["id"], "output": content}
+                    else {
+                        "type": "function_call_output",
+                        "call_id": call["id"],
+                        "output": content,
+                    }
                 )
     except urllib.error.HTTPError as error:
         record["http"] = error.code
@@ -233,7 +264,9 @@ def main(argv=None):
     parser.add_argument("--api", choices=["chat", "responses"], default="chat")
     parser.add_argument("--workload", choices=["text", "tools"], default="text")
     parser.add_argument("--model", default="deepseek-v4.1-flash-free")
-    parser.add_argument("--key-file", type=Path, help="없으면 GATEWAY_API_KEY 환경변수 사용")
+    parser.add_argument(
+        "--key-file", type=Path, help="없으면 GATEWAY_API_KEY 환경변수 사용"
+    )
     parser.add_argument("--workers", nargs="+", type=worker_count, default=[1, 2, 4])
     parser.add_argument("--timeout", type=float, default=135)
     args = parser.parse_args(argv)
@@ -248,7 +281,9 @@ def main(argv=None):
     except OSError:
         parser.error("키 파일을 읽을 수 없습니다.")
     if not key or any(character.isspace() for character in key):
-        parser.error("GATEWAY_API_KEY 또는 --key-file로 공백 없는 인증 키를 제공하세요.")
+        parser.error(
+            "GATEWAY_API_KEY 또는 --key-file로 공백 없는 인증 키를 제공하세요."
+        )
     records = []
     print(
         json.dumps(
@@ -285,7 +320,8 @@ def main(argv=None):
         records.extend(batch)
         for row in batch:
             print(
-                "RECORD " + json.dumps({"workers": workers, **row}, ensure_ascii=False), flush=True
+                "RECORD " + json.dumps({"workers": workers, **row}, ensure_ascii=False),
+                flush=True,
             )
         print(
             "SUMMARY "
@@ -296,7 +332,9 @@ def main(argv=None):
                     "success": sum(row["success"] for row in batch),
                     "http": [row["http"] for row in batch],
                     "wall_s": round(duration, 3),
-                    "mean_s": round(statistics.mean(row["elapsed_s"] for row in batch), 3),
+                    "mean_s": round(
+                        statistics.mean(row["elapsed_s"] for row in batch), 3
+                    ),
                     "requests_per_s": round(workers / duration, 3),
                 },
                 ensure_ascii=False,
@@ -306,7 +344,10 @@ def main(argv=None):
     print(
         "TOTAL "
         + json.dumps(
-            {"requests": len(records), "success": sum(row["success"] for row in records)},
+            {
+                "requests": len(records),
+                "success": sum(row["success"] for row in records),
+            },
             ensure_ascii=False,
         ),
         flush=True,

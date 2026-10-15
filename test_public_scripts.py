@@ -77,10 +77,13 @@ class PublicScriptTests(unittest.TestCase):
                 payload = json.loads(run.call_args.kwargs["input"])
                 self.assertEqual(payload["registration"]["provider"]["apiKey"], token)
                 self.assertEqual(
-                    payload["registration"]["provider"]["baseUrl"], "http://127.0.0.1:8940/v1"
+                    payload["registration"]["provider"]["baseUrl"],
+                    "http://127.0.0.1:8940/v1",
                 )
                 self.assertFalse(payload["registration"]["setDefault"])
-                self.assertEqual(payload["adminTokenFile"], "~/.opencodex/admin-api-token")
+                self.assertEqual(
+                    payload["adminTokenFile"], "~/.opencodex/admin-api-token"
+                )
 
     def test_registration_refuses_non_loopback_admin_destination(self):
         with contextlib.redirect_stderr(io.StringIO()):
@@ -108,11 +111,19 @@ class PublicScriptTests(unittest.TestCase):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 requests.append((self.path, self.headers.get("Authorization")))
                 messages = body["messages"] if api == "chat" else body["input"]
-                nonce = re.search(r'nonce는 "([a-z0-9]+)"', messages[0]["content"]).group(1)
-                text = json.dumps({"nonce": nonce, "squares": [n * n for n in range(1, 17)]})
+                nonce = re.search(
+                    r'nonce는 "([a-z0-9]+)"', messages[0]["content"]
+                ).group(1)
+                text = json.dumps(
+                    {"nonce": nonce, "squares": [n * n for n in range(1, 17)]}
+                )
                 if api == "chat":
                     events = [
-                        {"choices": [{"delta": {"content": text}, "finish_reason": None}]},
+                        {
+                            "choices": [
+                                {"delta": {"content": text}, "finish_reason": None}
+                            ]
+                        },
                         {"choices": [{"delta": {}, "finish_reason": "stop"}]},
                         {
                             "choices": [],
@@ -175,15 +186,25 @@ class PublicScriptTests(unittest.TestCase):
                         )
                     )
                 self.assertTrue(all(row["success"] for row in results))
-                self.assertTrue(all(row["usage"]["total_tokens"] == 23 for row in results))
+                self.assertTrue(
+                    all(row["usage"]["total_tokens"] == 23 for row in results)
+                )
                 self.assertEqual(len(requests), 2)
                 path = "/v1/chat/completions" if api == "chat" else "/v1/responses"
-                self.assertTrue(all(request == (path, "Bearer " + key) for request in requests))
+                self.assertTrue(
+                    all(request == (path, "Bearer " + key) for request in requests)
+                )
 
     def test_stream_error_is_not_success_even_after_text(self):
         url, key, _requests = self.endpoint("chat", failed=True)
         result = benchmark.call(
-            0, threading.Barrier(1), base_url=url, model="fixture", api="chat", key=key, timeout=5
+            0,
+            threading.Barrier(1),
+            base_url=url,
+            model="fixture",
+            api="chat",
+            key=key,
+            timeout=5,
         )
         self.assertFalse(result["success"])
         self.assertEqual(result["error"]["message"], "fixture failure")
@@ -198,7 +219,7 @@ class PublicScriptTests(unittest.TestCase):
                 call = {
                     "id": "call_fixture",
                     "type": "function",
-                    "function": {"name": "lookup", "arguments": '{"key":"alpha"}'},
+                    "function": {"name": "read", "arguments": '{"path":"value.txt"}'},
                 }
                 if len(seen) == 1:
                     if api == "chat":
@@ -232,7 +253,8 @@ class PublicScriptTests(unittest.TestCase):
                     history = payload["messages"] if api == "chat" else payload["input"]
                     result = history[-1]
                     self.assertEqual(
-                        result["tool_call_id"] if api == "chat" else result["call_id"], call["id"]
+                        result["tool_call_id"] if api == "chat" else result["call_id"],
+                        call["id"],
                     )
                     self.assertEqual(
                         history[-2]["tool_calls"][0]["id"]
@@ -240,9 +262,7 @@ class PublicScriptTests(unittest.TestCase):
                         else history[-2]["call_id"],
                         call["id"],
                     )
-                    actual = json.loads(result["content"] if api == "chat" else result["output"])[
-                        "value"
-                    ]
+                    actual = result["content"] if api == "chat" else result["output"]
                     if api == "chat":
                         body = {
                             "choices": [
@@ -259,7 +279,9 @@ class PublicScriptTests(unittest.TestCase):
                             "output": [
                                 {
                                     "type": "message",
-                                    "content": [{"type": "output_text", "text": actual}],
+                                    "content": [
+                                        {"type": "output_text", "text": actual}
+                                    ],
                                 }
                             ],
                             "usage": {"total_tokens": 22},

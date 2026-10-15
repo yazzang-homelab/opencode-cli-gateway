@@ -21,7 +21,6 @@ function invalid(message) {
 }
 export const isRecord = (value) =>
   value !== null && typeof value === "object" && !Array.isArray(value);
-export const mcpFunctionName = (index) => "fn" + index;
 
 export function stableJson(value) {
   if (Array.isArray(value)) return "[" + value.map(stableJson).join(",") + "]";
@@ -84,7 +83,6 @@ export function normalizeTools(value = []) {
         "함수 매개변수는 16KiB 이하의 object JSON Schema여야 합니다.",
       );
     compileParameters(parameters);
-    mcpToolSchema(parameters);
     return {
       type: "function",
       function: {
@@ -99,82 +97,19 @@ export function normalizeTools(value = []) {
   });
 }
 
-export function compileParameters(schema) {
+function compileParameters(schema) {
   const compiler =
     typeof schema.$schema === "string" && schema.$schema.includes("2020-12")
       ? ajv2020
       : ajv;
   try {
-    const validate = compiler.compile(schema);
+    compiler.compile(schema);
     compiler.removeSchema(schema);
-    return validate;
   } catch {
     throw invalid(
       "지원하지 않거나 잘못된 함수 JSON Schema입니다. 외부 참조는 허용하지 않습니다.",
     );
   }
-}
-
-// OpenCode forces additionalProperties:false on the MCP root. An envelope keeps
-// the caller's original object schema intact rather than silently narrowing it.
-export function mcpToolSchema(parameters) {
-  const original = structuredClone(parameters);
-  const visit = (schema, root = false) => {
-    if (!isRecord(schema)) return;
-    if (!root && typeof schema.$id === "string")
-      throw invalid("중첩 $id는 지원하지 않습니다.");
-    if (schema.$dynamicRef !== undefined || schema.$recursiveRef !== undefined)
-      throw invalid("동적 스키마 참조는 지원하지 않습니다.");
-    if (typeof schema.$ref === "string") {
-      if (schema.$ref !== "#" && !schema.$ref.startsWith("#/"))
-        throw invalid("로컬 JSON Pointer 스키마 참조만 지원합니다.");
-      schema.$ref = "#/properties/arguments" + schema.$ref.slice(1);
-    }
-    delete schema.$id;
-    delete schema.$schema;
-    for (const key of [
-      "properties",
-      "patternProperties",
-      "$defs",
-      "definitions",
-      "dependentSchemas",
-      "dependencies",
-    ]) {
-      if (isRecord(schema[key]))
-        for (const child of Object.values(schema[key]))
-          if (!Array.isArray(child)) visit(child);
-    }
-    for (const key of [
-      "items",
-      "prefixItems",
-      "additionalProperties",
-      "unevaluatedProperties",
-      "contains",
-      "not",
-      "if",
-      "then",
-      "else",
-      "propertyNames",
-      "additionalItems",
-      "unevaluatedItems",
-      "contentSchema",
-      "allOf",
-      "anyOf",
-      "oneOf",
-    ]) {
-      if (Array.isArray(schema[key]))
-        schema[key].forEach((child) => visit(child));
-      else visit(schema[key]);
-    }
-  };
-  visit(original, true);
-  return {
-    ...(parameters.$schema ? { $schema: parameters.$schema } : {}),
-    type: "object",
-    properties: { arguments: original },
-    required: ["arguments"],
-    additionalProperties: false,
-  };
 }
 
 export function normalizeToolChoice(value, tools) {

@@ -202,7 +202,7 @@ test(
 );
 
 test(
-  "모델 목록은 도구·이미지 미지원을 광고하고 모델 불일치는 실행 전에 404이다",
+  "모델 목록은 도구·이미지 지원과 요청 의미를 광고하고 모델 불일치는 실행 전에 404이다",
   { timeout: 5000 },
   async (t) => {
     let calls = 0;
@@ -220,8 +220,12 @@ test(
     assert.equal(models.data[0].id, MODEL);
     assert.equal(models.data[0].object, "model");
     assert.equal(models.data[0].supports_tool_use, true);
-    assert.equal(models.data[0].supports_vision, false);
-    assert.match(models.data[0].metadata.system_message_semantics, /대화 기록/);
+    assert.equal(models.data[0].supports_vision, true);
+    assert.deepEqual(models.data[0].input_modalities, ["text", "image"]);
+    assert.match(
+      models.data[0].metadata.request_semantics,
+      /replace OpenCode's own prompt/,
+    );
     const missing = await chat(server, input({ model: "다른-모델" }));
     assert.equal(missing.status, 404);
     assert.equal(json(missing).error.code, "model_not_found");
@@ -294,7 +298,7 @@ test(
 );
 
 test(
-  "텍스트·역할·샘플링과 출력 토큰을 보존하고 비활성 도구 선언은 허용한다",
+  "텍스트·역할·샘플링·추가 생성 옵션과 출력 토큰을 보존한다",
   { timeout: 5000 },
   async (t) => {
     const received = [];
@@ -330,7 +334,14 @@ test(
         n: 1,
         temperature: 0,
         top_p: 1,
-        max_completion_tokens: 8192,
+        max_completion_tokens: 32000,
+        stop: "끝",
+        seed: 7,
+        frequency_penalty: 0.5,
+        presence_penalty: -0.5,
+        reasoning_effort: "max",
+        user: "caller",
+        response_format: { type: "json_object" },
       }),
     );
     assert.equal(response.status, 200);
@@ -339,21 +350,33 @@ test(
       messages: [
         { role: "system", content: "시스템 대화 기록" },
         { role: "developer", content: "개발자 기록" },
-        { role: "user", content: "질문 둘" },
+        {
+          role: "user",
+          content: "질문 둘",
+          parts: [
+            { type: "text", text: "질문 " },
+            { type: "text", text: "둘" },
+          ],
+        },
         { role: "assistant", content: "이전 응답" },
       ],
-      maxOutputTokens: 8192,
+      maxOutputTokens: 32000,
       tools: [],
       toolChoice: "auto",
       parallelToolCalls: false,
+      options: {
+        stop: ["끝"],
+        seed: 7,
+        frequency_penalty: 0.5,
+        presence_penalty: -0.5,
+        reasoning_effort: "max",
+        user: "caller",
+        response_format: { type: "json_object" },
+      },
       temperature: 0,
       topP: 1,
     });
-    assert.match(
-      json(response).metadata.system_message_semantics,
-      /네이티브 OpenCode 에이전트.*대화 기록/,
-    );
-    assert.equal(json(response).metadata.streaming, "completed_text_parts");
+    assert.equal(json(response).metadata.streaming, "token_deltas");
     assert.equal(
       (
         await chat(
@@ -447,9 +470,59 @@ test(
       ["응답 저장", { store: true }],
       ["응답 저장 타입", { store: "false" }],
       ["응답 저장 null", { store: null }],
-      ["stop", { stop: ["끝"] }],
-      ["response_format", { response_format: { type: "json_object" } }],
-      ["seed", { seed: 1 }],
+      ["빈 stop", { stop: [] }],
+      ["stop 초과", { stop: ["a", "b", "c", "d", "e"] }],
+      ["response_format 종류", { response_format: { type: "xml" } }],
+      [
+        "json_schema 이름",
+        { response_format: { type: "json_schema", json_schema: {} } },
+      ],
+      ["seed 소수", { seed: 1.5 }],
+      ["추론 강도", { reasoning_effort: "medium" }],
+      ["penalty 범위", { presence_penalty: 3 }],
+      [
+        "원격 이미지",
+        {
+          messages: [
+            {
+              role: "user",
+              content: [
+                {
+                  type: "image_url",
+                  image_url: { url: "data:image/svg+xml;base64,AAAA" },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      [
+        "어시스턴트 이미지",
+        {
+          messages: [
+            { role: "user", content: "질문" },
+            {
+              role: "assistant",
+              content: [
+                {
+                  type: "image_url",
+                  image_url: { url: "data:image/png;base64,AAAA" },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+      ["user 없음", { messages: [{ role: "system", content: "S" }] }],
+      [
+        "중간 system",
+        {
+          messages: [
+            { role: "user", content: "질문" },
+            { role: "system", content: "S" },
+          ],
+        },
+      ],
       ["logprobs", { logprobs: false }],
       ["여러 응답", { n: 2 }],
       ["n 타입", { n: "1" }],
@@ -462,7 +535,7 @@ test(
       ["큰 top_p", { top_p: 1.01 }],
       ["top_p 타입", { top_p: false }],
       ["출력 제한 영", { max_tokens: 0 }],
-      ["출력 제한 초과", { max_tokens: 8193 }],
+      ["출력 제한 초과", { max_tokens: 32001 }],
       ["출력 제한 소수", { max_tokens: 1.5 }],
       ["출력 제한 문자열", { max_tokens: "10" }],
       ["출력 제한 null", { max_completion_tokens: null }],
@@ -530,7 +603,7 @@ test(
 );
 
 test(
-  "SSE는 완성 텍스트 파트와 종료 청크·요청된 usage·DONE을 보낸다",
+  "SSE는 runner 델타를 즉시 보내고 종료 청크·요청된 usage·DONE을 보낸다",
   { timeout: 5000 },
   async (t) => {
     const server = await fixture(t, {
@@ -552,7 +625,7 @@ test(
     assert.equal(parsed.filter((entry) => entry.data === "[DONE]").length, 1);
     const chunks = parsed.slice(0, -1).map((entry) => entry.data);
     assert.equal(chunks[0].choices[0].delta.role, "assistant");
-    assert.match(chunks[0].metadata.system_message_semantics, /대화 기록/);
+    assert.match(chunks[0].metadata.request_semantics, /one model step/);
     assert.deepEqual(
       chunks.slice(1, 3).map((entry) => entry.choices[0].delta.content),
       ["첫 ", "응답"],
@@ -895,7 +968,7 @@ test(
   },
 );
 
-test("외부 함수 응답은 이름·ID·JSON 인자를 보존하고 전송 완료 뒤에만 대기를 확정한다", async (t) => {
+test("함수 호출 응답은 이름·ID·JSON 인자와 실제 사용량을 그대로 반환한다", async (t) => {
   const tool = {
     type: "function",
     function: {
@@ -908,11 +981,10 @@ test("외부 함수 응답은 이름·ID·JSON 인자를 보존하고 전송 완
     },
   };
   const call = {
-    id: "call_gw_fixture",
+    id: "call_00_fixture",
     type: "function",
     function: { name: "lookup", arguments: '{"key":"alpha"}' },
   };
-  let committed = 0;
   const server = await fixture(t, {
     run: async (normalized) => {
       assert.equal(normalized.tools[0].function.name, "lookup");
@@ -922,13 +994,10 @@ test("외부 함수 응답은 이름·ID·JSON 인자를 보존하고 전송 완
       });
       return {
         text: "",
+        reasoning: "판단",
         toolCalls: [call],
         finishReason: "tool_calls",
-        usage: null,
-        commit: () => {
-          committed++;
-        },
-        cancel: async () => assert.fail("정상 응답은 취소하지 않음"),
+        usage: { ...USAGE },
       };
     },
   });
@@ -945,30 +1014,28 @@ test("외부 함수 응답은 이름·ID·JSON 인자를 보존하고 전송 완
   assert.deepEqual(json(response).choices[0].message, {
     role: "assistant",
     content: null,
+    reasoning_content: "판단",
     tool_calls: [call],
   });
-  assert.equal(json(response).usage, null);
-  assert.equal(committed, 1);
+  assert.deepEqual(json(response).usage, USAGE);
 });
 
-test("SSE 함수 호출은 안정된 index와 ID를 내보내고 tool_calls로 종료한다", async (t) => {
+test("SSE는 추론·함수 호출을 안정된 index와 ID로 내보내고 tool_calls로 종료한다", async (t) => {
   const calls = ["one", "two"].map((name, index) => ({
     id: "call_" + index,
     type: "function",
     function: { name, arguments: '{"value":3}' },
   }));
-  let committed = false;
   const server = await fixture(t, {
-    run: async () => ({
-      text: "",
-      toolCalls: calls,
-      finishReason: "tool_calls",
-      usage: null,
-      commit: () => {
-        committed = true;
-      },
-      cancel: async () => {},
-    }),
+    run: async (_normalized, { onReasoning }) => {
+      onReasoning("생각");
+      return {
+        text: "",
+        toolCalls: calls,
+        finishReason: "tool_calls",
+        usage: { ...USAGE },
+      };
+    },
   });
   const response = await chat(
     server,
@@ -977,6 +1044,7 @@ test("SSE 함수 호출은 안정된 index와 ID를 내보내고 tool_calls로 �
   const frames = events(response)
     .filter((frame) => frame.data !== "[DONE]")
     .map((frame) => frame.data);
+  assert.equal(frames[1].choices[0].delta.reasoning_content, "생각");
   const emitted = frames.flatMap((frame) =>
     frame.choices.flatMap((choice) => choice.delta?.tool_calls ?? []),
   );
@@ -989,7 +1057,37 @@ test("SSE 함수 호출은 안정된 index와 ID를 내보내고 tool_calls로 �
       .finish_reason,
     "tool_calls",
   );
-  assert.equal(committed, true);
+  assert.deepEqual(frames.at(-1).usage, USAGE);
+});
+
+test("사용자 이미지 data URL은 원래 순서의 파일 파트로 전달한다", async (t) => {
+  let received;
+  const server = await fixture(t, {
+    run: async (request) => {
+      received = request.messages[0];
+      return result();
+    },
+  });
+  const url = "data:image/png;base64,iVBORw0KGgo=";
+  const response = await chat(
+    server,
+    input({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "이 그림" },
+            { type: "image_url", image_url: { url, detail: "high" } },
+          ],
+        },
+      ],
+    }),
+  );
+  assert.equal(response.status, 200);
+  assert.deepEqual(received.parts, [
+    { type: "text", text: "이 그림" },
+    { type: "file", mime: "image/png", url, filename: "image" },
+  ]);
 });
 
 test("호출 이력과 실제 도구 결과는 tool_call_id로 검증하고 runner에 전달한다", async (t) => {

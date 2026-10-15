@@ -45,7 +45,9 @@ def api_url(value):
             raise ValueError()
         parsed.port
     except ValueError as error:
-        raise argparse.ArgumentTypeError("자격증명·쿼리 없는 HTTP(S) URL이 필요합니다.") from error
+        raise argparse.ArgumentTypeError(
+            "자격증명·쿼리 없는 HTTP(S) URL이 필요합니다."
+        ) from error
     return value.rstrip("/")
 
 
@@ -70,32 +72,40 @@ def registration(name, gateway_url, token):
             "defaultModel": MODEL,
             "models": [MODEL],
             "liveModels": True,
-            "contextWindow": 128000,
+            "contextWindow": 200000,
             "defaultMaxOutputTokens": 8192,
-            "modelMaxOutputTokens": {MODEL: 8192},
-            "modelCapabilities": {MODEL: {"inputModalities": ["text"]}},
-            "modelDisplayNames": {MODEL: "DeepSeek V4.1 Flash Free · CLI 클라이언트 도구 왕복"},
+            "modelMaxOutputTokens": {MODEL: 32000},
+            "modelCapabilities": {MODEL: {"inputModalities": ["text", "image"]}},
+            "modelDisplayNames": {
+                MODEL: "DeepSeek V4.1 Flash Free · OpenCode CLI 무상태 단일 단계"
+            },
         },
     }
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ssh-host", required=True, help="관리 호스트에 접속할 SSH 대상 또는 별칭")
+    parser.add_argument(
+        "--ssh-host", required=True, help="관리 호스트에 접속할 SSH 대상 또는 별칭"
+    )
     parser.add_argument(
         "--gateway-base-url",
         required=True,
         type=api_url,
         help="관리 호스트에서 접근 가능한 게이트웨이 /v1 URL",
     )
-    parser.add_argument("--token-file", type=Path, default=Path("/etc/opencode-cli-gateway/token"))
+    parser.add_argument(
+        "--token-file", type=Path, default=Path("/etc/opencode-cli-gateway/token")
+    )
     parser.add_argument("--name", type=provider_name, default="opencode-cli")
     parser.add_argument(
         "--admin-token-file",
         default="~/.opencodex/admin-api-token",
         help="원격 호스트의 관리자 토큰 경로",
     )
-    parser.add_argument("--management-url", type=api_url, default="http://127.0.0.1:10101")
+    parser.add_argument(
+        "--management-url", type=api_url, default="http://127.0.0.1:10101"
+    )
     args = parser.parse_args(argv)
     if args.ssh_host.startswith("-"):
         parser.error("SSH 대상은 옵션으로 시작할 수 없습니다.")
