@@ -1,0 +1,42 @@
+[Unit]
+Description=Official OpenCode CLI text gateway
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/opencode-cli-gateway
+ExecStart=/usr/bin/node /opt/opencode-cli-gateway/main.mjs
+Environment=GATEWAY_HOST=127.0.0.1
+Environment=GATEWAY_PORT=8940
+Environment=GATEWAY_WORKERS=4
+Environment=GATEWAY_TIMEOUT_MS=120000
+Environment=GATEWAY_STATE_DIR=/var/lib/opencode-cli-gateway
+Environment=GATEWAY_CACHE_DIR=/var/cache/opencode-cli-gateway
+Environment=GATEWAY_TOKEN_FILE=%d/token
+LoadCredential=token:/etc/opencode-cli-gateway/token
+StateDirectory=opencode-cli-gateway
+StateDirectoryMode=0700
+CacheDirectory=opencode-cli-gateway
+CacheDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+CapabilityBoundingSet=
+KillMode=control-group
+TimeoutStopSec=10
+MemoryMax=2G
+TasksMax=256
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

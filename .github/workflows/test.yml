@@ -1,0 +1,28 @@
+name: 테스트
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node: [20, 22]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: npm ci --ignore-scripts --no-audit --no-fund
+      - run: npm test
+      - run: python3 -m unittest -v test_public_scripts.py
+      - run: python3 -m py_compile register-oci.py benchmark.py

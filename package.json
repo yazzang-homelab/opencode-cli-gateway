@@ -1,0 +1,15 @@
+{
+  "name": "opencode-cli-gateway",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node main.mjs",
+    "test": "node --test *.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "opencode-ai": "1.19.0"
+  }
+}
