@@ -48,7 +48,7 @@
 | API       | `POST /v1/chat/completions`, `GET /v1/models`: Bearer 인증. `GET /healthz`: 인증 없음, 상류 검사 아님                                                                                                  |
 | 메시지    | 앞부분의 `system`·`developer`(합쳐서 시스템 프롬프트), `user`, `assistant`(`tool_calls`, `reasoning_content`), `tool`                                                                                  |
 | 입력 형식 | 텍스트 문자열·텍스트 파트. **사용자 이미지**: PNG·JPEG·GIF·WebP base64 data URL(원격 URL은 미지원)                                                                                                     |
-| 함수      | OpenAI `type: function` 최대 64개, 이름 1~64자, object 루트 JSON Schema 16KiB. 스키마는 변형 없이 상류로 전달                                                                                          |
+| 함수      | OpenAI `type: function` 최대 512개(한도는 사실상 모델 컨텍스트), 이름 1~64자, 설명 32768자, object 루트 JSON Schema 64KiB. 스키마는 변형 없이 상류로 전달. 한 응답의 호출은 최대 64개                  |
 | 도구 선택 | `auto`, `none`, `required`, 특정 함수 강제                                                                                                                                                             |
 | 병렬 호출 | 한 단계의 호출을 모두 반환. `parallel_tool_calls`는 상류로 전달하고, `false`일 때는 첫 호출만 반환                                                                                                     |
 | 생성 옵션 | `temperature`, `top_p`, `max_tokens`/`max_completion_tokens`(1~32000, 기본 1024), `stop`, `seed`, `frequency_penalty`, `presence_penalty`, `reasoning_effort`(low·high·max), `response_format`, `user` |
@@ -56,6 +56,8 @@
 | 응답      | `reasoning_content`, `tool_calls`, 실제 상류 `usage`(캐시·추론 토큰 포함)                                                                                                                              |
 | 미지원    | 오디오·파일 입력, 도구 결과 이미지, legacy `function` 역할, custom/freeform 도구, `n>1`, `logprobs`, `store: true`                                                                                     |
 | 프로토콜  | Responses·Messages는 직접 제공하지 않음. 별도 프로토콜 프록시 필요                                                                                                                                     |
+
+함수 정의는 매 요청마다 프롬프트 토큰을 씁니다. MCP 서버가 붙은 GJC의 함수 155개는 약 43K 토큰이었습니다. 실측으로 상류는 함수 310개까지 받았습니다.
 
 JSON Schema의 `format`은 주석입니다. 클라이언트도 자체 인자 검증·권한 정책·실행 격리를 적용해야 합니다.
 

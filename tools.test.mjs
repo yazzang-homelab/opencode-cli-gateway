@@ -56,7 +56,10 @@ test("함수 정의는 원래 스키마를 그대로 보존하고 이름·정의
         function: { name: "bad", parameters: { type: "object", $schema: 42 } },
       },
     ],
-    Array(65).fill(tool),
+    Array.from({ length: 513 }, (_, index) => ({
+      ...tool,
+      function: { ...tool.function, name: `fn${index}` },
+    })),
   ]) {
     assert.throws(
       () => normalizeTools(tools),
@@ -91,6 +94,22 @@ test("draft-07와 2020-12 및 로컬 참조를 허용하고 사용자 스키마 
       assert.deepEqual(normalized.function.parameters, parameters);
     }
   }
+});
+
+test("MCP 서버가 많은 클라이언트의 함수 수백 개와 긴 설명을 허용한다", () => {
+  const many = Array.from({ length: 512 }, (_, index) => ({
+    type: "function",
+    function: {
+      name: `mcp__server_tool_${index}`,
+      description: "설명".repeat(8000),
+      parameters: tool.function.parameters,
+    },
+  }));
+  assert.equal(normalizeTools(many).length, 512);
+  assert.throws(
+    () => normalizeHistoryCalls(Array(65).fill(call)),
+    (error) => error.status === 400,
+  );
 });
 
 test("tool_choice 강제 함수는 선언된 이름만 허용한다", () => {

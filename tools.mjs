@@ -14,7 +14,12 @@ const ajv2020 = new Ajv2020({
 });
 const NAME = /^[A-Za-z0-9_-]{1,64}$/;
 const ID = /^[A-Za-z0-9_.:-]{1,160}$/;
-const MAX_TOOLS = 64;
+// Definitions are bounded by the model context rather than a count: GJC with
+// MCP servers sends 150+ functions, and the upstream accepted 310 in testing.
+const MAX_TOOLS = 512;
+const MAX_CALLS = 64;
+const MAX_DESCRIPTION = 32768;
+const MAX_SCHEMA_BYTES = 65536;
 
 function invalid(message) {
   return new GatewayError(400, "invalid_tools", message);
@@ -40,7 +45,7 @@ export function stableJson(value) {
 
 export function normalizeTools(value = []) {
   if (!Array.isArray(value) || value.length > MAX_TOOLS)
-    throw invalid("tools는 64개 이하의 함수 배열이어야 합니다.");
+    throw invalid(`tools는 ${MAX_TOOLS}개 이하의 함수 배열이어야 합니다.`);
   const names = new Set();
   return value.map((tool) => {
     if (
@@ -68,19 +73,22 @@ export function normalizeTools(value = []) {
     names.add(fn.name);
     if (
       fn.description !== undefined &&
-      (typeof fn.description !== "string" || fn.description.length > 8192)
+      (typeof fn.description !== "string" ||
+        fn.description.length > MAX_DESCRIPTION)
     )
-      throw invalid("함수 설명은 8192자 이하 문자열이어야 합니다.");
+      throw invalid(
+        `함수 설명은 ${MAX_DESCRIPTION}자 이하 문자열이어야 합니다.`,
+      );
     if (fn.strict !== undefined && typeof fn.strict !== "boolean")
       throw invalid("strict는 불리언이어야 합니다.");
     const parameters = fn.parameters ?? { type: "object", properties: {} };
     if (
       !isRecord(parameters) ||
       parameters.type !== "object" ||
-      Buffer.byteLength(stableJson(parameters)) > 16384
+      Buffer.byteLength(stableJson(parameters)) > MAX_SCHEMA_BYTES
     )
       throw invalid(
-        "함수 매개변수는 16KiB 이하의 object JSON Schema여야 합니다.",
+        "함수 매개변수는 64KiB 이하의 object JSON Schema여야 합니다.",
       );
     compileParameters(parameters);
     return {
@@ -134,7 +142,7 @@ export function normalizeToolChoice(value, tools) {
 }
 
 export function normalizeHistoryCalls(value) {
-  if (!Array.isArray(value) || !value.length || value.length > MAX_TOOLS)
+  if (!Array.isArray(value) || !value.length || value.length > MAX_CALLS)
     throw invalid("assistant.tool_calls는 1~64개 호출 배열이어야 합니다.");
   return value.map((call) => {
     if (
