@@ -51,6 +51,11 @@ const METADATA = Object.freeze({
   streaming: "token_deltas",
   supports_vision: true,
 });
+const REASONING = Object.freeze({
+  supports_reasoning: true,
+  reasoning_efforts: [...REASONING_EFFORTS],
+  reasoning_content: "streamed_and_accepted_in_history",
+});
 
 function invalid(message, code = "invalid_request") {
   return new GatewayError(400, code, message);
@@ -851,6 +856,7 @@ export function createGateway({
               context_length: 200000,
               max_output_tokens: 32000,
               input_modalities: ["text", "image"],
+              ...REASONING,
               metadata: METADATA,
             },
           ],

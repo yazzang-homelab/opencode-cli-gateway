@@ -222,6 +222,8 @@ test(
     assert.equal(models.data[0].supports_tool_use, true);
     assert.equal(models.data[0].supports_vision, true);
     assert.deepEqual(models.data[0].input_modalities, ["text", "image"]);
+    assert.equal(models.data[0].supports_reasoning, true);
+    assert.deepEqual(models.data[0].reasoning_efforts, ["low", "high", "max"]);
     assert.match(
       models.data[0].metadata.request_semantics,
       /replace OpenCode's own prompt/,

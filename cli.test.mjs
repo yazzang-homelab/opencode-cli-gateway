@@ -291,6 +291,31 @@ test("텍스트 전용 요청은 거절된 내장 도구 단계 뒤 최종 답�
   assert.equal(result.usage.total_tokens, 24);
 });
 
+test("호출자에 없는 OpenCode read 호출은 거절 처리하고 호출자 함수만 반환한다", async (t) => {
+  const events = [
+    attempt(0),
+    { type: "gateway.native_rejected", name: "read" },
+    {
+      type: "gateway.call",
+      id: "call_x",
+      name: "lookup",
+      arguments: { key: "k" },
+    },
+    step("tool-calls"),
+  ];
+  const f = await fixture(t, cli({ events }));
+  const result = await f.runner.run({
+    ...request,
+    tools: [lookup],
+    toolChoice: "auto",
+  });
+  assert.equal(result.finishReason, "tool_calls");
+  assert.deepEqual(
+    result.toolCalls.map((call) => call.function.name),
+    ["lookup"],
+  );
+});
+
 test("공식 CLI의 상류 오류 상태와 메시지를 보존한다", async (t) => {
   const f = await fixture(
     t,
@@ -414,5 +439,16 @@ test("플러그인 요청은 원래 역할·도구 결과·함수 정의·생성
     maxOutputTokens: 512,
   });
   assert.deepEqual(spec.options, { parallel_tool_calls: false, seed: 7 });
+  // The AI SDK drops snake_case `reasoning_effort`; only `reasoningEffort` reaches the upstream body.
+  assert.deepEqual(
+    pluginRequest({
+      ...request,
+      options: { reasoning_effort: "max", stop: ["x"] },
+    }).options,
+    {
+      stop: ["x"],
+      reasoningEffort: "max",
+    },
+  );
   assert.equal(pluginRequest(request).mode, "native");
 });

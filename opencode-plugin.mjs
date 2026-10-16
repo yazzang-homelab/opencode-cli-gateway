@@ -134,6 +134,7 @@ export const GatewayPlugin = async () => {
     cache: { read: 0, write: 0 },
   };
   let finished = 0;
+  let stepCalls = 0;
   let stepFinished = false;
   let cost = 0;
 
@@ -146,6 +147,7 @@ export const GatewayPlugin = async () => {
           args: {},
           // Never reaches the model: `chat.params` blocks the follow-up request.
           async execute(args, context) {
+            stepCalls += 1;
             emit({
               type: "call",
               id: context.callID,
@@ -177,12 +179,13 @@ export const GatewayPlugin = async () => {
           tokens.cache.read += step.cache?.read ?? 0;
           tokens.cache.write += step.cache?.write ?? 0;
           cost += part.cost ?? 0;
-          // Text-only requests keep OpenCode's own tools under a rejecting
-          // permission policy, so a rejected native call starts another step.
-          if (caller || part.reason !== "tool-calls") {
+          // A step that only called OpenCode's own (rejected) `read` has
+          // nothing for the caller; the CLI continues with another step.
+          if (stepCalls > 0 || part.reason !== "tool-calls") {
             stepFinished = true;
             emit({ type: "step", reason: part.reason, tokens, cost });
           }
+          stepCalls = 0;
         }
         return;
       }
@@ -198,14 +201,15 @@ export const GatewayPlugin = async () => {
     },
 
     async "chat.message"(_input, output) {
-      if (!caller) return;
       // Hide OpenCode's own tools; a caller function with the same name
       // replaces the built-in entry in OpenCode's tool registry instead.
+      // OpenCode's own `read` stays when the caller has none: the free
+      // upstream rejects requests without it. The non-interactive CLI denies
+      // it if the model calls it, and the model continues in the same run.
       output.message.tools = Object.fromEntries(
-        BUILTIN_TOOLS.filter((name) => !callerTools.has(name)).map((name) => [
-          name,
-          false,
-        ]),
+        BUILTIN_TOOLS.filter(
+          (name) => name !== "read" && !callerTools.has(name),
+        ).map((name) => [name, false]),
       );
     },
 
@@ -227,9 +231,10 @@ export const GatewayPlugin = async () => {
     },
 
     async "tool.execute.before"(input) {
-      if (!caller) emit({ type: "native_rejected", name: input.tool });
-      else if (!callerTools.has(input.tool))
-        emit({ type: "native_call", name: input.tool });
+      if (callerTools.has(input.tool)) return;
+      if (!caller || input.tool === "read")
+        emit({ type: "native_rejected", name: input.tool });
+      else emit({ type: "native_call", name: input.tool });
     },
 
     async "experimental.chat.system.transform"(_input, output) {
@@ -273,7 +278,7 @@ export const GatewayPlugin = async () => {
         emit({
           type: "fatal",
           code: "native_tool_loop",
-          message: "text-only request kept calling OpenCode tools",
+          message: "model kept calling OpenCode tools the caller does not own",
         });
         await new Promise(() => {});
       }

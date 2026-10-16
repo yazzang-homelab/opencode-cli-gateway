@@ -85,6 +85,43 @@ class PublicScriptTests(unittest.TestCase):
                     payload["adminTokenFile"], "~/.opencodex/admin-api-token"
                 )
 
+    def test_registration_declares_native_reasoning_effort_ladder(self):
+        provider = register.registration("p", "http://127.0.0.1:8940/v1", "x" * 40)[
+            "provider"
+        ]
+        model = register.MODEL
+        self.assertEqual(
+            provider["modelReasoningEfforts"][model], ["low", "high", "max"]
+        )
+        mapped = provider["modelReasoningEffortMap"][model]
+        self.assertTrue(set(mapped.values()) <= {"low", "high", "max"})
+        self.assertEqual(mapped["xhigh"], "max")
+        self.assertEqual(provider["modelDefaultReasoningEfforts"][model], "high")
+        self.assertEqual(provider["preserveReasoningContentModels"], [model])
+
+    def test_update_is_explicit_and_carries_full_registration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "gateway.token"
+            path.write_text(secrets.token_urlsafe(40))
+            for update in (False, True):
+                with patch.object(
+                    register.subprocess,
+                    "run",
+                    return_value=SimpleNamespace(returncode=0, stdout="{}\n"),
+                ) as run:
+                    with contextlib.redirect_stdout(io.StringIO()):
+                        register.main(
+                            ["--ssh-host", "h", "--token-file", str(path)]
+                            + ["--gateway-base-url", "http://127.0.0.1:8940/v1"]
+                            + (["--update"] if update else [])
+                        )
+                payload = json.loads(run.call_args.kwargs["input"])
+                self.assertIs(payload["update"], update)
+                self.assertIn(
+                    "modelReasoningEffortMap", payload["registration"]["provider"]
+                )
+                self.assertFalse(payload["registration"]["setDefault"])
+
     def test_registration_refuses_non_loopback_admin_destination(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):

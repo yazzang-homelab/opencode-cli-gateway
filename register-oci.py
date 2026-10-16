@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SSH 안의 인증된 OpenCodex 관리 API에 CLI 중계 공급자를 등록한다."""
+"""SSH 안의 인증된 OpenCodex 관리 API에 CLI 중계 공급자를 등록하거나 메타데이터를 갱신한다."""
 
 import argparse
 import json
@@ -10,25 +10,37 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 MODEL = "deepseek-v4.1-flash-free"
+REASONING_EFFORTS = ("low", "high", "max")
+REASONING_EFFORT_MAP = {
+    "minimal": "low",
+    "low": "low",
+    "medium": "high",
+    "high": "high",
+    "xhigh": "max",
+    "max": "max",
+}
+DEFAULT_REASONING_EFFORT = "high"
 REMOTE_SCRIPT = r"""
-import json,sys,urllib.request,urllib.error
+import json,sys,urllib.parse,urllib.request,urllib.error
 from pathlib import Path
 request=json.load(sys.stdin)
 admin=Path(request['adminTokenFile']).expanduser().read_text().strip()
 base=request['managementUrl']
 headers={'Authorization':'Bearer '+admin,'Content-Type':'application/json'}
+name=request['name']
 try:
  req=urllib.request.Request(base+'/api/providers',headers=headers)
  with urllib.request.urlopen(req,timeout=20) as response: existing=json.load(response)
- if any(provider.get('name')==request['registration']['name'] for provider in existing):
-  print(json.dumps({'error':'기존 공급자는 덮어쓰지 않습니다.'},ensure_ascii=False))
+ exists=any(provider.get('name')==name for provider in existing)
+ if exists!=request['update']:
+  print(json.dumps({'error':'기존 공급자는 --update로만 갱신합니다.' if exists else '갱신할 공급자가 없습니다.'},ensure_ascii=False))
   raise SystemExit(1)
  req=urllib.request.Request(base+'/api/providers',data=json.dumps(request['registration'],ensure_ascii=False).encode(),headers=headers,method='POST')
  with urllib.request.urlopen(req,timeout=60) as response:
   result=json.load(response)
-  print(json.dumps({'http':response.status,'success':result.get('success'),'name':result.get('name')},ensure_ascii=False))
+  print(json.dumps({'http':response.status,'success':result.get('success'),'name':name},ensure_ascii=False))
 except urllib.error.HTTPError as error:
- print(json.dumps({'http':error.code,'error':'공급자 등록 요청이 거절되었습니다.'},ensure_ascii=False))
+ print(json.dumps({'http':error.code,'error':'공급자 등록·갱신 요청이 거절되었습니다.'},ensure_ascii=False))
  raise SystemExit(1)
 except (OSError,ValueError):
  print(json.dumps({'error':'관리 API 연결이나 자격증명 파일을 확인하세요.'},ensure_ascii=False))
@@ -59,6 +71,25 @@ def provider_name(value):
     return value
 
 
+# Model metadata owned by this gateway. Reasoning effort follows the model's
+# native ladder (low/high/max); the proxy maps client levels onto it so the
+# gateway never receives an effort it would reject.
+def model_metadata():
+    return {
+        "contextWindow": 200000,
+        "defaultMaxOutputTokens": 8192,
+        "modelMaxOutputTokens": {MODEL: 32000},
+        "modelCapabilities": {MODEL: {"inputModalities": ["text", "image"]}},
+        "modelDisplayNames": {
+            MODEL: "DeepSeek V4.1 Flash Free · OpenCode CLI 무상태 단일 단계"
+        },
+        "modelReasoningEfforts": {MODEL: list(REASONING_EFFORTS)},
+        "modelReasoningEffortMap": {MODEL: dict(REASONING_EFFORT_MAP)},
+        "modelDefaultReasoningEfforts": {MODEL: DEFAULT_REASONING_EFFORT},
+        "preserveReasoningContentModels": [MODEL],
+    }
+
+
 def registration(name, gateway_url, token):
     return {
         "name": name,
@@ -72,13 +103,7 @@ def registration(name, gateway_url, token):
             "defaultModel": MODEL,
             "models": [MODEL],
             "liveModels": True,
-            "contextWindow": 200000,
-            "defaultMaxOutputTokens": 8192,
-            "modelMaxOutputTokens": {MODEL: 32000},
-            "modelCapabilities": {MODEL: {"inputModalities": ["text", "image"]}},
-            "modelDisplayNames": {
-                MODEL: "DeepSeek V4.1 Flash Free · OpenCode CLI 무상태 단일 단계"
-            },
+            **model_metadata(),
         },
     }
 
@@ -89,8 +114,12 @@ def main(argv=None):
         "--ssh-host", required=True, help="관리 호스트에 접속할 SSH 대상 또는 별칭"
     )
     parser.add_argument(
+        "--update",
+        action="store_true",
+        help="이 스크립트로 만든 기존 공급자를 현재 등록 내용(effort·컨텍스트·입력 형식 포함)으로 덮어씀",
+    )
+    parser.add_argument(
         "--gateway-base-url",
-        required=True,
         type=api_url,
         help="관리 호스트에서 접근 가능한 게이트웨이 /v1 URL",
     )
@@ -111,6 +140,8 @@ def main(argv=None):
         parser.error("SSH 대상은 옵션으로 시작할 수 없습니다.")
     if urlsplit(args.management_url).hostname not in {"127.0.0.1", "localhost", "::1"}:
         parser.error("관리 자격증명은 SSH 호스트의 루프백 API로만 전송합니다.")
+    if not args.gateway_base_url:
+        parser.error("--gateway-base-url이 필요합니다.")
     try:
         token = args.token_file.read_text().strip()
     except OSError:
@@ -118,6 +149,8 @@ def main(argv=None):
     if len(token) < 32 or any(character.isspace() for character in token):
         parser.error("토큰은 공백 없는 32자 이상 문자열이어야 합니다.")
     payload = {
+        "name": args.name,
+        "update": args.update,
         "registration": registration(args.name, args.gateway_base_url, token),
         "managementUrl": args.management_url,
         "adminTokenFile": args.admin_token_file,

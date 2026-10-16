@@ -22,24 +22,25 @@
 
 - **게이트웨이는 무상태입니다.** 도구 결과를 기다리며 유지하는 CLI·세션·TTL이 없습니다. 매 요청의 이력이 진실의 원천이므로 요청마다 도구 목록·스키마가 바뀌어도, 이력을 압축·편집해도, 게이트웨이를 재시작해도, 다른 인스턴스로 라우팅해도 동작합니다.
 - **도구 실행은 클라이언트 소유입니다.** 플러그인 도구는 모델이 낸 호출을 보고만 하며, 결과가 모델로 다시 가기 전에 프로세스가 끝납니다. 게이트웨이 호스트는 파일 읽기·쓰기·셸을 실행하지 않습니다.
-- **OpenCode 자체 프롬프트가 섞이지 않습니다.** 모의 상류로 실제 전송 본문을 캡처해 확인했습니다. `messages`는 호출자 system과 원래 역할 순서의 대화·`tool_calls`·`tool` 결과뿐이고, `tools`는 호출자 함수의 원래 이름·설명·스키마뿐입니다. OpenCode 에이전트 지시, 환경 블록(작업 경로·날짜), 기본 도구는 전송되지 않습니다.
+- **OpenCode 자체 프롬프트가 섞이지 않습니다.** 모의 상류로 실제 전송 본문을 캡처해 확인했습니다. `messages`는 호출자 system과 원래 역할 순서의 대화·`tool_calls`·`tool` 결과뿐이고, `tools`는 호출자 함수의 원래 이름·설명·스키마입니다. 예외는 아래 상류 제한 때문에 남기는 OpenCode `read` 정의 하나입니다. OpenCode 에이전트 지시와 환경 블록(작업 경로·날짜)은 전송되지 않습니다.
 - `tool_choice: "required"`와 특정 함수 강제는 상류 `tool_choice: "required"`로 전송합니다. 함수 강제는 해당 함수만 선언합니다. 텍스트만 반환하면 성공으로 위장하지 않고 502로 실패합니다.
 - 상류가 출력 전에 재시도하면 그대로 이어집니다. 일부 출력을 이미 보낸 뒤 같은 단계를 재시도하면, 중복 출력을 피하려고 실패 처리합니다.
 
-### 상류 제한: `read` 함수가 필요함
+### 상류 제한과 OpenCode `read` 도구
 
-고정 CLI로 보낸 요청이라도, OpenCode 무료 상류는 **함수 목록에 `read`가 없으면** 403 `FreeTierError`("free tier can only be used from within OpenCode")를 반환했습니다. 실측 결과는 다음과 같습니다.
+OpenCode 무료 상류는 고정 CLI로 보낸 요청이라도 **함수 목록에 `read`가 없으면** 403 `FreeTierError`("free tier can only be used from within OpenCode")를 반환합니다. 실측 결과는 다음과 같습니다.
 
-| 함수 목록                                | 결과 |
-| ---------------------------------------- | ---- |
-| `read` 포함(단독·다른 함수와 함께)       | 성공 |
-| `lookup`, `write`, `bash`, `report` 단독 | 403  |
-| 함수 없음                                | 403  |
+| 함수 목록                                                        | 결과 |
+| ---------------------------------------------------------------- | ---- |
+| `read` 포함(단독·다른 함수와 함께)                               | 성공 |
+| `lookup`, `write`, `bash`, `generate_image` 단독, 또는 함수 없음 | 403  |
 
-이 게이트웨이는 판정을 통과하려고 가짜 함수를 끼워 넣지 않습니다. 그래서 다음처럼 동작합니다.
+정식 OpenCode 클라이언트는 항상 자기 `read` 도구를 보냅니다. 이 게이트웨이도 같은 방식을 씁니다. **호출자 함수에 `read`가 없으면 OpenCode 자체의 `read` 도구 정의를 함께 보냅니다.** 가짜 함수를 새로 만들지 않고, 그 외 OpenCode 기본 도구는 모두 숨깁니다.
 
-- **함수가 있는 요청**: 호출자 함수만 보내므로, `read`가 없으면 403이 그대로 전달됩니다. GJC·Claude Code·Codex 같은 코딩 에이전트는 파일 읽기 함수를 보냅니다. 다만 이름이 정확히 `read`여야 합니다(GJC는 해당).
-- **함수가 없거나 `tool_choice: "none"`인 요청**: OpenCode의 기본 도구 목록을 그대로 보내고 시스템 프롬프트와 이력만 교체합니다. 모델이 기본 도구를 부르면 비대화형 CLI가 권한을 거절하고, 모델은 같은 실행에서 텍스트로 답을 이어 갑니다. 이 경우 프롬프트 토큰이 약 5.8K 늘고, 거절 단계를 포함해 최대 4단계 안에 끝나지 않으면 502입니다.
+- 모델이 OpenCode `read`를 호출하면 비대화형 CLI가 권한을 거절합니다. 모델은 같은 실행에서 이어서 답하거나 호출자 함수를 부릅니다. 이 호출은 클라이언트에 전달되지 않습니다.
+- 호출자 함수에 `read`가 있으면 그 정의가 OpenCode `read`를 대체하므로, 상류에는 호출자 함수만 전송됩니다.
+- OpenCode `read` 정의 때문에 프롬프트가 수백 토큰 늘어납니다. 거절 단계를 포함해 최대 4단계 안에 끝나지 않으면 502입니다.
+- GJC에 이미지 역할만 설정된 경우처럼, `--no-tools`여도 `generate_image` 하나만 보내는 클라이언트를 이 방식으로 처리합니다.
 
 ## 지원 범위
 
@@ -60,6 +61,19 @@
 함수 정의는 매 요청마다 프롬프트 토큰을 씁니다. MCP 서버가 붙은 GJC의 함수 155개는 약 43K 토큰이었습니다. 실측으로 상류는 함수 310개까지 받았습니다.
 
 JSON Schema의 `format`은 주석입니다. 클라이언트도 자체 인자 검증·권한 정책·실행 격리를 적용해야 합니다.
+
+### 추론 강도(effort)
+
+모델의 기본 단계는 `low`·`high`·`max` 세 가지입니다. `reasoning_effort`로 지정하며, 그 밖의 값은 400입니다. `GET /v1/models`는 `supports_reasoning: true`와 `reasoning_efforts`를 광고합니다.
+
+- 고정 CLI의 AI SDK는 snake_case `reasoning_effort` 옵션을 버리므로, 게이트웨이는 camelCase `reasoningEffort`로 넘깁니다. 모의 상류에서 실제 본문의 `reasoning_effort` 전송을 확인했습니다.
+- 지정하지 않으면 상류 기본값을 따릅니다.
+- 클라이언트 단계(`minimal`·`medium`·`xhigh` 등)는 프록시나 클라이언트 설정에서 매핑합니다. `register-oci.py`는 OpenCodex에 다음을 등록합니다.
+  - 단계 목록: `low`·`high`·`max`
+  - 매핑: `minimal→low`, `medium→high`, `xhigh→max`
+  - 기본값: `high`
+  - 이력의 `reasoning_content` 보존
+- 같은 어려운 문제를 직접 호출로 비교한 실측에서 추론 토큰이 약 2.1K(`low`)에서 약 5.7K(`max`)로 늘었습니다. 다른 실행에서는 차이가 거의 없거나 역전되기도 했으므로, 실행 1회 결과로 효과를 판단하지 않습니다.
 
 ## 설치와 로컬 실행
 
@@ -227,11 +241,13 @@ python3 register-oci.py --ssh-host your-relay \
   --gateway-base-url http://127.0.0.1:8940/v1 --token-file "$GATEWAY_TOKEN_FILE"
 ```
 
+이미 등록한 공급자의 모델 메타데이터(effort 단계·매핑·기본값, 컨텍스트, 출력 한도, 이미지 입력)를 바꾸려면 `--update`를 붙입니다. 같은 이름의 공급자를 이 스크립트의 등록 내용으로 덮어쓰며, 기본 공급자는 바꾸지 않습니다. OpenCodex의 공급자 `PATCH`는 effort 필드를 무시하므로 쓰지 않습니다.
+
 루프백은 각 프로세스의 호스트 자신입니다. 다른 호스트는 보호된 연결을 구성하세요. OpenCodex의 설치·Codex 설정 동기화 동작은 [해당 프로젝트 문서](https://opencodex.me/)를 확인하세요. 모델 목록의 표기만으로 이 서버의 제한이 바뀌지 않습니다.
 
 ## 부록 A. Claude Code
 
-**상류 제한 주의**: Claude Code의 읽기 함수 이름은 `Read`(대문자)입니다. 위의 `read` 규칙에 따르면 403이 예상되며, 실제로는 검증하지 않았습니다.
+**참고**: Claude Code의 읽기 함수 이름은 `Read`(대문자)이므로 OpenCode `read` 정의가 함께 전송됩니다. Claude Code 자체는 검증하지 않았습니다.
 
 Claude Code는 Anthropic Messages를 쓰므로 8940 직접 연결은 불가합니다. 별도 Messages 프록시가 필요하며, 함수 왕복 지원과 특정 Claude Code 버전의 모든 요청 호환성은 다릅니다.
 
@@ -258,7 +274,7 @@ Claude Code 2.1.292의 이전 텍스트 전용 호출에서는 프록시 경유 
 
 ## 부록 B. Codex CLI
 
-**상류 제한 주의**: Codex CLI는 셸·패치 함수 중심이며 `read` 함수를 보내지 않습니다. 위 규칙에 따르면 403이 예상되며, 실제로는 검증하지 않았습니다.
+**참고**: Codex CLI는 `read` 함수를 보내지 않으므로 OpenCode `read` 정의가 함께 전송됩니다. Codex CLI 자체는 검증하지 않았습니다.
 
 Codex CLI는 Responses가 필요하므로 별도 프록시를 사용합니다. **일반 Responses 함수 왕복은 실제 검증했지만, Codex CLI 0.153.4 자체의 모든 도구·코딩 동작을 검증한 것은 아닙니다.** custom/freeform·웹 검색 등은 프록시가 지원되는 함수 형태로 변환해야 하며 이 서버가 직접 수용하지 않습니다.
 
@@ -304,18 +320,33 @@ providers:
     api: openai-completions
     auth: apiKey
     compat:
-      supportsReasoningEffort: false
+      supportsReasoningEffort: true
+      reasoningEffortMap:
+        {
+          minimal: low,
+          low: low,
+          medium: high,
+          high: high,
+          xhigh: max,
+          max: max,
+        }
     models:
       - id: deepseek-v4.1-flash-free
         name: OpenCode CLI 무상태 단일 단계
-        reasoning: false
+        reasoning: true
+        thinking:
+          mode: effort
+          minLevel: low
+          maxLevel: max
+          levels: [low, high, max]
+          defaultLevel: high
         input: [text, image]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         contextWindow: 200000
         maxTokens: 8192
 ```
 
-`apiKeyEnv`는 실제 환경변수 이름 참조입니다. YAML에 토큰 값을 저장하거나 `${...}` 보간을 추측하지 않습니다. 비용·컨텍스트 값은 현재 모델과 클라이언트 설정이며 향후 정책·최대 컨텍스트 실측을 보장하지 않습니다. `reasoning: false`는 별도 추론 제어를 전송하지 않는 설정이지 모델 내부 추론이 없다는 뜻이 아닙니다.
+`apiKeyEnv`는 실제 환경변수 이름 참조입니다. YAML에 토큰 값을 저장하거나 `${...}` 보간을 추측하지 않습니다. 비용·컨텍스트 값은 현재 모델과 클라이언트 설정이며 향후 정책·최대 컨텍스트 실측을 보장하지 않습니다. `thinking.levels`는 모델의 실제 단계와 같아야 합니다. GJC는 모델 ID에 `deepseek`가 들어 있으면 DeepSeek 공식 API 기준 매핑(`low→high`)을 적용하므로, `reasoningEffortMap`을 명시해 `low`를 그대로 보내게 합니다. 목록에 없는 단계는 GJC가 아래 단계로 내립니다(`medium→low`, `xhigh→high`). 실제 GJC로 `minimal·low→low`, `high→high`, `max→max` 전송을 확인했습니다. OCI 경유라면 모델 목록의 `reasoning_efforts`에서 단계를 자동으로 읽으며, 공급자 `compat.supportsReasoningEffort: true`가 필요합니다.
 
 ```bash
 (
@@ -330,7 +361,7 @@ providers:
 
 GJC **0.18.11**에서 `--tools read,write` 읽기·쓰기 왕복과 `--tools read,edit,write,bash,find,search` 다단계 코딩 작업(테스트 실행·수정·재실행)을 검증했습니다. 도구는 **GJC 프로세스가 있는 클라이언트**에서 실행됩니다. 텍스트만 필요하면 `--tools read` 대신 `--no-tools`를 쓰세요. `--mode json`은 CLI 출력 형식이지 모델 JSON 강제 기능이 아닙니다.
 
-OCI 프록시를 쓰려면 별도 공급자의 `baseUrl`을 프록시 `/v1`로, 키를 프록시 키로, 모델 ID를 `opencode-cli/deepseek-v4.1-flash-free`로 바꾸세요. 공급자 이름이 `ocx-cli-tools`라면 선택자는 `ocx-cli-tools/opencode-cli/deepseek-v4.1-flash-free`입니다. `openai-completions`를 유지하세요. GJC는 항상 `read`를 보내므로 상류 제한에 걸리지 않지만, `--tools`에서 `read`를 빼면 403입니다.
+OCI 프록시를 쓰려면 별도 공급자의 `baseUrl`을 프록시 `/v1`로, 키를 프록시 키로, 모델 ID를 `opencode-cli/deepseek-v4.1-flash-free`로 바꾸세요. 공급자 이름이 `ocx-cli-tools`라면 선택자는 `ocx-cli-tools/opencode-cli/deepseek-v4.1-flash-free`입니다. `openai-completions`를 유지하세요. GJC가 `read`를 보내면 그 정의가 그대로 쓰이고, 보내지 않으면 OpenCode `read` 정의가 함께 전송됩니다.
 
 공식 자료: [Gajae-Code](https://github.com/Yeachan-Heo/gajae-code), [모델·키·호환 설정](https://github.com/Yeachan-Heo/gajae-code/blob/main/docs/models.md).
 

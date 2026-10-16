@@ -81,10 +81,19 @@ export function pluginRequest(request) {
       topP: request.topP,
       maxOutputTokens: request.maxOutputTokens,
     },
-    options: {
-      ...(caller ? { parallel_tool_calls: request.parallelToolCalls } : {}),
-      ...request.options,
-    },
+    options: providerOptions(request, caller),
+  };
+}
+
+// OpenCode passes these as AI SDK providerOptions. The openai-compatible
+// provider forwards unknown keys verbatim but rebuilds `reasoning_effort`
+// from the camelCase `reasoningEffort` option and drops the snake_case key.
+function providerOptions(request, caller) {
+  const { reasoning_effort: reasoningEffort, ...rest } = request.options;
+  return {
+    ...(caller ? { parallel_tool_calls: request.parallelToolCalls } : {}),
+    ...rest,
+    ...(reasoningEffort ? { reasoningEffort } : {}),
   };
 }
 
