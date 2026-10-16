@@ -9,7 +9,17 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit
 
-MODEL = "deepseek-v4.1-flash-free"
+# Display names of the OpenCode free models the gateway serves; the first one
+# is the provider default. Both share the same limits and effort ladder.
+MODELS = {
+    "deepseek-v4.1-flash-free": "DeepSeek V4.1 Flash Free · OpenCode CLI 무상태 단일 단계",
+    "glm-5.3-flash-free": "GLM-5.3 Flash Free · OpenCode CLI 무상태 단일 단계",
+}
+# The free GLM upstream ignores image input; see server.mjs MODELS.
+INPUT_MODALITIES = {
+    "deepseek-v4.1-flash-free": ("text", "image"),
+    "glm-5.3-flash-free": ("text",),
+}
 REASONING_EFFORTS = ("low", "high", "max")
 REASONING_EFFORT_MAP = {
     "minimal": "low",
@@ -78,15 +88,20 @@ def model_metadata():
     return {
         "contextWindow": 200000,
         "defaultMaxOutputTokens": 8192,
-        "modelMaxOutputTokens": {MODEL: 32000},
-        "modelCapabilities": {MODEL: {"inputModalities": ["text", "image"]}},
-        "modelDisplayNames": {
-            MODEL: "DeepSeek V4.1 Flash Free · OpenCode CLI 무상태 단일 단계"
+        "modelMaxOutputTokens": {model: 32000 for model in MODELS},
+        "modelCapabilities": {
+            model: {"inputModalities": list(INPUT_MODALITIES[model])}
+            for model in MODELS
         },
-        "modelReasoningEfforts": {MODEL: list(REASONING_EFFORTS)},
-        "modelReasoningEffortMap": {MODEL: dict(REASONING_EFFORT_MAP)},
-        "modelDefaultReasoningEfforts": {MODEL: DEFAULT_REASONING_EFFORT},
-        "preserveReasoningContentModels": [MODEL],
+        "modelDisplayNames": dict(MODELS),
+        "modelReasoningEfforts": {model: list(REASONING_EFFORTS) for model in MODELS},
+        "modelReasoningEffortMap": {
+            model: dict(REASONING_EFFORT_MAP) for model in MODELS
+        },
+        "modelDefaultReasoningEfforts": {
+            model: DEFAULT_REASONING_EFFORT for model in MODELS
+        },
+        "preserveReasoningContentModels": list(MODELS),
     }
 
 
@@ -100,8 +115,8 @@ def registration(name, gateway_url, token):
             "apiKey": token,
             "authMode": "key",
             "allowPrivateNetwork": True,
-            "defaultModel": MODEL,
-            "models": [MODEL],
+            "defaultModel": next(iter(MODELS)),
+            "models": list(MODELS),
             "liveModels": True,
             **model_metadata(),
         },

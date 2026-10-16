@@ -8,7 +8,15 @@ import {
   validateHistory,
 } from "./tools.mjs";
 
-const DEFAULT_MODEL_ID = "deepseek-v4.1-flash-free";
+// OpenCode free models served by the fixed CLI. Both document a 200K
+// context, 32K output and the `low`/`high`/`max` effort ladder on models.dev,
+// verified against the free upstream. GLM lists image input, but the free
+// upstream ignores it (prompt tokens do not change, colors are guessed), so the
+// gateway refuses images for it instead of advertising them.
+export const MODELS = Object.freeze({
+  "deepseek-v4.1-flash-free": Object.freeze({ input: ["text", "image"] }),
+  "glm-5.3-flash-free": Object.freeze({ input: ["text"] }),
+});
 const MAX_STREAM_BUFFER_BYTES = 1024 * 1024;
 const ROLES = new Set(["system", "developer", "user", "assistant", "tool"]);
 const TEXT_PART_TYPES = new Set(["text", "input_text", "output_text"]);
@@ -49,7 +57,6 @@ const METADATA = Object.freeze({
   tool_execution: "caller_owned",
   tool_continuation: "stateless_history",
   streaming: "token_deltas",
-  supports_vision: true,
 });
 const REASONING = Object.freeze({
   supports_reasoning: true,
@@ -201,13 +208,13 @@ function withParts(message, parts) {
   return message.role === "user" ? { ...message, parts } : message;
 }
 
-function normalizeRequest(body, modelId) {
+function normalizeRequest(body, models) {
   if (!isObject(body)) throw invalid("요청 본문은 JSON 객체여야 합니다.");
   onlyFields(body, REQUEST_FIELDS, "요청");
   if (typeof body.model !== "string" || body.model.length === 0) {
     throw invalid("model은 비어 있지 않은 문자열이어야 합니다.");
   }
-  if (body.model !== modelId) {
+  if (!Object.hasOwn(models, body.model)) {
     throw new GatewayError(
       404,
       "model_not_found",
@@ -262,9 +269,20 @@ function normalizeRequest(body, modelId) {
   ) {
     throw invalid("max_tokens와 max_completion_tokens의 값이 서로 충돌합니다.");
   }
+  const messages = body.messages.map(normalizeMessage);
+  if (
+    !models[body.model].input.includes("image") &&
+    messages.some((message) =>
+      message.parts?.some((part) => part.type === "file"),
+    )
+  )
+    throw invalid(
+      "이 모델은 이미지 입력을 지원하지 않습니다.",
+      "unsupported_content",
+    );
   const normalized = {
-    modelId,
-    messages: body.messages.map(normalizeMessage),
+    modelId: body.model,
+    messages,
     maxOutputTokens: body.max_completion_tokens ?? body.max_tokens ?? 1024,
     tools,
     toolChoice,
@@ -493,7 +511,7 @@ function checkResult(result) {
 
 export function createGateway({
   token,
-  modelId = DEFAULT_MODEL_ID,
+  models = MODELS,
   run,
   workerStats,
   maxWorkers = 4,
@@ -506,11 +524,14 @@ export function createGateway({
     );
   }
   if (
-    typeof modelId !== "string" ||
-    modelId.trim().length === 0 ||
+    !isObject(models) ||
+    Object.keys(models).length === 0 ||
+    Object.values(models).some(
+      (model) => !Array.isArray(model?.input) || !model.input.includes("text"),
+    ) ||
     typeof run !== "function"
   ) {
-    throw new TypeError("유효한 modelId와 run 함수가 필요합니다.");
+    throw new TypeError("유효한 models와 run 함수가 필요합니다.");
   }
   if (
     !Number.isSafeInteger(maxWorkers) ||
@@ -546,6 +567,7 @@ export function createGateway({
     let admitted = false;
     let stream = false;
     let includeUsage = false;
+    let modelId = Object.keys(models)[0];
     let streamStarted = false;
     const abort = (reason) => {
       if (!signal.aborted) controller.abort(reason);
@@ -666,8 +688,9 @@ export function createGateway({
     try {
       const parsed = normalizeRequest(
         await readJson(req, maxBodyBytes, signal),
-        modelId,
+        models,
       );
+      modelId = parsed.normalized.modelId;
       ({ stream, includeUsage } = parsed);
       signal.throwIfAborted();
       if (active >= maxWorkers) {
@@ -844,22 +867,20 @@ export function createGateway({
         req.resume();
         sendJson(res, 200, {
           object: "list",
-          data: [
-            {
-              id: modelId,
-              object: "model",
-              created: modelCreated,
-              owned_by: "opencode-cli-gateway",
-              supports_tool_use: true,
-              supports_vision: true,
-              context_window: 200000,
-              context_length: 200000,
-              max_output_tokens: 32000,
-              input_modalities: ["text", "image"],
-              ...REASONING,
-              metadata: METADATA,
-            },
-          ],
+          data: Object.entries(models).map(([id, model]) => ({
+            id,
+            object: "model",
+            created: modelCreated,
+            owned_by: "opencode-cli-gateway",
+            supports_tool_use: true,
+            supports_vision: model.input.includes("image"),
+            context_window: 200000,
+            context_length: 200000,
+            max_output_tokens: 32000,
+            input_modalities: [...model.input],
+            ...REASONING,
+            metadata: METADATA,
+          })),
         });
         return;
       }

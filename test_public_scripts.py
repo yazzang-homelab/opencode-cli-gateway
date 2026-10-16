@@ -89,15 +89,23 @@ class PublicScriptTests(unittest.TestCase):
         provider = register.registration("p", "http://127.0.0.1:8940/v1", "x" * 40)[
             "provider"
         ]
-        model = register.MODEL
+        models = ["deepseek-v4.1-flash-free", "glm-5.3-flash-free"]
+        self.assertEqual(provider["models"], models)
+        self.assertEqual(provider["defaultModel"], models[0])
+        for model in models:
+            self.assertEqual(
+                provider["modelReasoningEfforts"][model], ["low", "high", "max"]
+            )
+            mapped = provider["modelReasoningEffortMap"][model]
+            self.assertTrue(set(mapped.values()) <= {"low", "high", "max"})
+            self.assertEqual(mapped["xhigh"], "max")
+            self.assertEqual(provider["modelDefaultReasoningEfforts"][model], "high")
+            self.assertEqual(provider["modelMaxOutputTokens"][model], 32000)
+            self.assertIn(model, provider["modelDisplayNames"])
+        self.assertEqual(provider["preserveReasoningContentModels"], models)
         self.assertEqual(
-            provider["modelReasoningEfforts"][model], ["low", "high", "max"]
+            provider["modelCapabilities"][models[1]]["inputModalities"], ["text"]
         )
-        mapped = provider["modelReasoningEffortMap"][model]
-        self.assertTrue(set(mapped.values()) <= {"low", "high", "max"})
-        self.assertEqual(mapped["xhigh"], "max")
-        self.assertEqual(provider["modelDefaultReasoningEfforts"][model], "high")
-        self.assertEqual(provider["preserveReasoningContentModels"], [model])
 
     def test_update_is_explicit_and_carries_full_registration(self):
         with tempfile.TemporaryDirectory() as directory:

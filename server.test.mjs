@@ -216,8 +216,10 @@ test(
     assert.equal(response.status, 200);
     const models = json(response);
     assert.equal(models.object, "list");
-    assert.equal(models.data.length, 1);
-    assert.equal(models.data[0].id, MODEL);
+    assert.deepEqual(
+      models.data.map((model) => model.id),
+      [MODEL, "glm-5.3-flash-free"],
+    );
     assert.equal(models.data[0].object, "model");
     assert.equal(models.data[0].supports_tool_use, true);
     assert.equal(models.data[0].supports_vision, true);
@@ -228,10 +230,57 @@ test(
       models.data[0].metadata.request_semantics,
       /replace OpenCode's own prompt/,
     );
+    assert.deepEqual(models.data[1].input_modalities, ["text"]);
+    assert.equal(models.data[1].supports_vision, false);
+    for (const model of models.data) {
+      assert.equal(model.context_window, 200000);
+      assert.equal(model.max_output_tokens, 32000);
+      assert.deepEqual(model.reasoning_efforts, ["low", "high", "max"]);
+    }
     const missing = await chat(server, input({ model: "다른-모델" }));
     assert.equal(missing.status, 404);
     assert.equal(json(missing).error.code, "model_not_found");
     assert.equal(calls, 0);
+  },
+);
+
+test(
+  "요청한 모델을 CLI에 넘기고 응답 model에 그대로 표시한다",
+  { timeout: 5000 },
+  async (t) => {
+    const received = [];
+    const server = await fixture(t, {
+      run: async (request) => {
+        received.push(request.modelId);
+        return result();
+      },
+    });
+    const glm = await chat(server, input({ model: "glm-5.3-flash-free" }));
+    assert.equal(glm.status, 200);
+    assert.equal(json(glm).model, "glm-5.3-flash-free");
+    const deepseek = await chat(server, input());
+    assert.equal(json(deepseek).model, MODEL);
+    assert.deepEqual(received, ["glm-5.3-flash-free", MODEL]);
+    const image = await chat(
+      server,
+      input({
+        model: "glm-5.3-flash-free",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "image_url",
+                image_url: { url: "data:image/png;base64,iVBORw0KGgo=" },
+              },
+            ],
+          },
+        ],
+      }),
+    );
+    assert.equal(image.status, 400);
+    assert.equal(json(image).error.code, "unsupported_content");
+    assert.equal(received.length, 2);
   },
 );
 

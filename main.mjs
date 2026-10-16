@@ -2,7 +2,7 @@ import { access, readFile } from "node:fs/promises";
 import { constants } from "node:fs";
 import { resolve } from "node:path";
 import { createCliRunner } from "./cli.mjs";
-import { createGateway } from "./server.mjs";
+import { MODELS, createGateway } from "./server.mjs";
 
 function integer(name, fallback, min, max) {
   const value = Number(process.env[name] ?? fallback);
@@ -31,7 +31,6 @@ const maxBodyBytes = integer(
   65536,
   33554432,
 );
-const modelId = "deepseek-v4.1-flash-free";
 const runner = createCliRunner({
   executable,
   maxWorkers,
@@ -40,7 +39,6 @@ const runner = createCliRunner({
 });
 const server = createGateway({
   token,
-  modelId,
   run: runner.run,
   workerStats: runner.stats,
   maxWorkers,
@@ -59,7 +57,7 @@ server.listen(port, host, () => {
       event: "listening",
       host,
       port,
-      modelId,
+      models: Object.keys(MODELS),
       maxWorkers,
       transport: "official-opencode-cli",
     }),

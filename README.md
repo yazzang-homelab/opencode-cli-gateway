@@ -1,6 +1,25 @@
 # opencode-cli-gateway
 
-정식 **OpenCode CLI**를 요청마다 한 번 실행해 OpenAI Chat Completions API로 제공합니다. 모델은 `deepseek-v4.1-flash-free`, CLI는 `opencode-ai@1.19.0`으로 고정합니다.
+정식 **OpenCode CLI**를 요청마다 한 번 실행해 OpenAI Chat Completions API로 제공합니다. CLI는 `opencode-ai@1.19.0`으로 고정합니다. 제공 모델은 OpenCode 무료 모델 두 개이며, 요청의 `model`로 고릅니다.
+
+| 모델 ID                    | 컨텍스트 | 최대 출력 | 입력          | effort             |
+| -------------------------- | -------- | --------- | ------------- | ------------------ |
+| `deepseek-v4.1-flash-free` | 200K     | 32000     | 텍스트·이미지 | `low`·`high`·`max` |
+| `glm-5.3-flash-free`       | 200K     | 32000     | 텍스트        | `low`·`high`·`max` |
+
+두 모델의 한도와 effort 단계는 models.dev의 OpenCode 항목에 공시된 값이며, 무료 상류에서 텍스트·함수 호출·`low`/`high`/`max`를 실측했습니다. `glm-5.3-flash-free`는 유료 `glm-5.3`과 다른 Flash 모델입니다.
+
+`glm-5.3-flash-free`는 models.dev에 이미지 입력이 공시되어 있지만, 무료 상류에서 실측하니 이미지를 반영하지 않았습니다. 이미지 데이터는 상류 요청에 실렸으나 이미지를 바꿔도 입력 토큰이 같았고, 단색 이미지 12건 중 5건만 색을 맞혔습니다. 같은 조건에서 DeepSeek는 6건을 모두 맞혔습니다. 따라서 게이트웨이는 GLM을 텍스트 전용으로 광고하고, 이미지가 든 요청은 400 `unsupported_content`로 거절합니다.
+
+GLM 무료 상류는 DeepSeek보다 훨씬 느렸습니다. 2026-10-16 실측 결과는 다음과 같습니다.
+
+| 측정                               | DeepSeek | GLM   |
+| ---------------------------------- | -------- | ----- |
+| `read` 왕복(4워커 평균)            | 17초     | 85초  |
+| 텍스트(4워커 평균)                 | 9초      | 50초  |
+| GJC 코딩 작업(OCI 경유, 모두 성공) | 22~26초  | 432초 |
+
+시간은 상류 상태에 따라 달라지며, 위 값은 해당 시점의 측정입니다.
 
 **비공식·독립 프로젝트입니다.** OpenCode·Anthropic·OpenAI·Gajae-Code의 공식 제품이나 완전한 호환성을 주장하지 않습니다. 다른 클라이언트로 위장하는 헤더나 비공개 엔드포인트를 쓰지 않으며, 상류 요청은 고정 CLI가 직접 보냅니다. 무료 모델의 제공 기간·한도·가격·가용성은 상류 정책에 달려 있습니다.
 
@@ -223,16 +242,16 @@ Node 테스트는 HTTP·SSE·이미지·생성 옵션·이력 검증·러너 이
 
 이 서버는 Chat Completions만 제공합니다. [OpenCodex (`ocx`)](https://github.com/lidge-jun/opencodex) 같은 별도 프록시가 Messages·Responses를 변환할 수 있습니다. 프록시가 함수 이름·호출 ID·인자·결과를 보존해야 합니다. 게이트웨이는 무상태이므로 어느 인스턴스로 라우팅해도 됩니다.
 
-| 위치                     | 값                                                            |
-| ------------------------ | ------------------------------------------------------------- |
-| 공급자 이름 예시         | `opencode-cli`                                                |
-| 상류 어댑터·URL          | `openai-chat`, 같은 호스트면 `http://127.0.0.1:8940/v1`       |
-| 상류 자격증명            | 게이트웨이 토큰, `key` 인증                                   |
-| 상류 모델                | `deepseek-v4.1-flash-free`                                    |
-| 클라이언트용 프록시 모델 | `opencode-cli/deepseek-v4.1-flash-free`                       |
-| Messages 기본 URL        | `http://127.0.0.1:10100`                                      |
-| Responses·Chat 기본 URL  | `http://127.0.0.1:10100/v1`                                   |
-| 클라이언트 키            | **프록시 접속 키**. 게이트웨이 토큰·관리자 키와 혼동하지 않음 |
+| 위치                     | 값                                                                         |
+| ------------------------ | -------------------------------------------------------------------------- |
+| 공급자 이름 예시         | `opencode-cli`                                                             |
+| 상류 어댑터·URL          | `openai-chat`, 같은 호스트면 `http://127.0.0.1:8940/v1`                    |
+| 상류 자격증명            | 게이트웨이 토큰, `key` 인증                                                |
+| 상류 모델                | `deepseek-v4.1-flash-free`, `glm-5.3-flash-free`                           |
+| 클라이언트용 프록시 모델 | `opencode-cli/deepseek-v4.1-flash-free`, `opencode-cli/glm-5.3-flash-free` |
+| Messages 기본 URL        | `http://127.0.0.1:10100`                                                   |
+| Responses·Chat 기본 URL  | `http://127.0.0.1:10100/v1`                                                |
+| 클라이언트 키            | **프록시 접속 키**. 게이트웨이 토큰·관리자 키와 혼동하지 않음              |
 
 등록 스크립트는 기존 이름을 덮어쓰거나 기본 공급자를 바꾸지 않습니다. SSH 대상의 관리자 키는 원격에서 읽고 게이트웨이 키는 표준입력으로 전달합니다. 관리 API는 SSH 대상의 루프백만 허용합니다.
 
@@ -332,7 +351,7 @@ providers:
         }
     models:
       - id: deepseek-v4.1-flash-free
-        name: OpenCode CLI 무상태 단일 단계
+        name: DeepSeek V4.1 Flash Free · OpenCode CLI
         reasoning: true
         thinking:
           mode: effort
@@ -341,6 +360,19 @@ providers:
           levels: [low, high, max]
           defaultLevel: high
         input: [text, image]
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+        contextWindow: 200000
+        maxTokens: 8192
+      - id: glm-5.3-flash-free
+        name: GLM-5.3 Flash Free · OpenCode CLI
+        reasoning: true
+        thinking:
+          mode: effort
+          minLevel: low
+          maxLevel: max
+          levels: [low, high, max]
+          defaultLevel: high
+        input: [text]
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
         contextWindow: 200000
         maxTokens: 8192
