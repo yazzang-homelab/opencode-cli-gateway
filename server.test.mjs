@@ -218,7 +218,7 @@ test(
     assert.equal(models.object, "list");
     assert.deepEqual(
       models.data.map((model) => model.id),
-      [MODEL, "glm-5.3-flash-free"],
+      [MODEL, "tidepool-alpha-free", "iceman-free"],
     );
     assert.equal(models.data[0].object, "model");
     assert.equal(models.data[0].supports_tool_use, true);
@@ -228,19 +228,67 @@ test(
     assert.deepEqual(models.data[0].reasoning_efforts, ["low", "high", "max"]);
     assert.match(
       models.data[0].metadata.request_semantics,
-      /replace OpenCode's own prompt/,
+      /OpenCode's own system prompt stays first/,
     );
-    assert.deepEqual(models.data[1].input_modalities, ["text"]);
-    assert.equal(models.data[1].supports_vision, false);
-    for (const model of models.data) {
-      assert.equal(model.context_window, 200000);
-      assert.equal(model.max_output_tokens, 32000);
-      assert.deepEqual(model.reasoning_efforts, ["low", "high", "max"]);
-    }
+    assert.deepEqual(
+      models.data.map((model) => [
+        model.context_window,
+        model.max_output_tokens,
+        model.supports_vision,
+        model.reasoning_efforts,
+      ]),
+      [
+        [200000, 32000, true, ["low", "high", "max"]],
+        [
+          1048576,
+          131072,
+          false,
+          ["minimal", "low", "medium", "high", "xhigh", "max"],
+        ],
+        [262144, 131072, false, []],
+      ],
+    );
     const missing = await chat(server, input({ model: "다른-모델" }));
     assert.equal(missing.status, 404);
     assert.equal(json(missing).error.code, "model_not_found");
     assert.equal(calls, 0);
+  },
+);
+
+test(
+  "출력 한도와 추론 강도는 모델마다 자기 범위로 검사한다",
+  { timeout: 5000 },
+  async (t) => {
+    const received = [];
+    const server = await fixture(t, {
+      run: async (request) => {
+        received.push([request.maxOutputTokens, request.options]);
+        return result();
+      },
+    });
+    const tidepool = await chat(
+      server,
+      input({
+        model: "tidepool-alpha-free",
+        max_tokens: 131072,
+        reasoning_effort: "minimal",
+      }),
+    );
+    assert.equal(tidepool.status, 200);
+    assert.deepEqual(received, [[131072, { reasoning_effort: "minimal" }]]);
+    for (const [overrides, code] of [
+      [{ model: "tidepool-alpha-free", max_tokens: 131073 }, "invalid_request"],
+      [{ reasoning_effort: "minimal" }, "unsupported_parameter"],
+      [
+        { model: "iceman-free", reasoning_effort: "high" },
+        "unsupported_parameter",
+      ],
+    ]) {
+      const response = await chat(server, input(overrides));
+      assert.equal(response.status, 400);
+      assert.equal(json(response).error.code, code);
+    }
+    assert.equal(received.length, 1);
   },
 );
 
@@ -255,16 +303,19 @@ test(
         return result();
       },
     });
-    const glm = await chat(server, input({ model: "glm-5.3-flash-free" }));
-    assert.equal(glm.status, 200);
-    assert.equal(json(glm).model, "glm-5.3-flash-free");
+    const tidepool = await chat(
+      server,
+      input({ model: "tidepool-alpha-free" }),
+    );
+    assert.equal(tidepool.status, 200);
+    assert.equal(json(tidepool).model, "tidepool-alpha-free");
     const deepseek = await chat(server, input());
     assert.equal(json(deepseek).model, MODEL);
-    assert.deepEqual(received, ["glm-5.3-flash-free", MODEL]);
+    assert.deepEqual(received, ["tidepool-alpha-free", MODEL]);
     const image = await chat(
       server,
       input({
-        model: "glm-5.3-flash-free",
+        model: "tidepool-alpha-free",
         messages: [
           {
             role: "user",
@@ -676,7 +727,7 @@ test(
     assert.equal(parsed.filter((entry) => entry.data === "[DONE]").length, 1);
     const chunks = parsed.slice(0, -1).map((entry) => entry.data);
     assert.equal(chunks[0].choices[0].delta.role, "assistant");
-    assert.match(chunks[0].metadata.request_semantics, /one model step/);
+    assert.match(chunks[0].metadata.request_semantics, /one model call/);
     assert.deepEqual(
       chunks.slice(1, 3).map((entry) => entry.choices[0].delta.content),
       ["첫 ", "응답"],

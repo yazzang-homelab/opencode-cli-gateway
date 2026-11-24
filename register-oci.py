@@ -9,27 +9,43 @@ import subprocess
 from pathlib import Path
 from urllib.parse import urlsplit
 
-# Display names of the OpenCode free models the gateway serves; the first one
-# is the provider default. Both share the same limits and effort ladder.
+# The OpenCode free models the gateway serves, mirroring server.mjs MODELS;
+# the first one is the provider default. Each model keeps its own published
+# limits and effort ladder: the proxy maps client levels onto the ladder, and
+# an empty ladder makes it drop reasoning_effort, so the gateway never
+# receives a level it would reject.
+FULL_LADDER = {level: level for level in ("minimal", "low", "medium", "high", "xhigh", "max")}
 MODELS = {
-    "deepseek-v4.1-flash-free": "DeepSeek V4.1 Flash Free · OpenCode CLI 무상태 단일 단계",
-    "glm-5.3-flash-free": "GLM-5.3 Flash Free · OpenCode CLI 무상태 단일 단계",
+    "deepseek-v4.1-flash-free": {
+        "name": "DeepSeek V4.1 Flash Free · OpenCode CLI 무상태 단일 단계",
+        "input": ("text", "image"),
+        "output": 32000,
+        "efforts": ("low", "high", "max"),
+        "effort_map": {
+            "minimal": "low",
+            "low": "low",
+            "medium": "high",
+            "high": "high",
+            "xhigh": "max",
+            "max": "max",
+        },
+        "default_effort": "high",
+    },
+    "tidepool-alpha-free": {
+        "name": "Tidepool Alpha Free (stealth) · OpenCode CLI 무상태 단일 단계",
+        "input": ("text",),
+        "output": 131072,
+        "efforts": tuple(FULL_LADDER),
+        "effort_map": FULL_LADDER,
+        "default_effort": "medium",
+    },
+    "iceman-free": {
+        "name": "Iceman Free (stealth) · OpenCode CLI 무상태 단일 단계",
+        "input": ("text",),
+        "output": 131072,
+        "efforts": (),
+    },
 }
-# The free GLM upstream ignores image input; see server.mjs MODELS.
-INPUT_MODALITIES = {
-    "deepseek-v4.1-flash-free": ("text", "image"),
-    "glm-5.3-flash-free": ("text",),
-}
-REASONING_EFFORTS = ("low", "high", "max")
-REASONING_EFFORT_MAP = {
-    "minimal": "low",
-    "low": "low",
-    "medium": "high",
-    "high": "high",
-    "xhigh": "max",
-    "max": "max",
-}
-DEFAULT_REASONING_EFFORT = "high"
 REMOTE_SCRIPT = r"""
 import json,sys,urllib.parse,urllib.request,urllib.error
 from pathlib import Path
@@ -81,25 +97,32 @@ def provider_name(value):
     return value
 
 
-# Model metadata owned by this gateway. Reasoning effort follows the model's
-# native ladder (low/high/max); the proxy maps client levels onto it so the
-# gateway never receives an effort it would reject.
+# Model metadata owned by this gateway, per model.
 def model_metadata():
+    laddered = {model: spec for model, spec in MODELS.items() if spec["efforts"]}
     return {
         "contextWindow": 200000,
-        "defaultMaxOutputTokens": 8192,
-        "modelMaxOutputTokens": {model: 32000 for model in MODELS},
-        "modelCapabilities": {
-            model: {"inputModalities": list(INPUT_MODALITIES[model])}
-            for model in MODELS
+        "modelContextWindows": {
+            "tidepool-alpha-free": 1048576,
+            "iceman-free": 262144,
         },
-        "modelDisplayNames": dict(MODELS),
-        "modelReasoningEfforts": {model: list(REASONING_EFFORTS) for model in MODELS},
+        "defaultMaxOutputTokens": 8192,
+        "modelMaxOutputTokens": {
+            model: spec["output"] for model, spec in MODELS.items()
+        },
+        "modelCapabilities": {
+            model: {"inputModalities": list(spec["input"])}
+            for model, spec in MODELS.items()
+        },
+        "modelDisplayNames": {model: spec["name"] for model, spec in MODELS.items()},
+        "modelReasoningEfforts": {
+            model: list(spec["efforts"]) for model, spec in MODELS.items()
+        },
         "modelReasoningEffortMap": {
-            model: dict(REASONING_EFFORT_MAP) for model in MODELS
+            model: dict(spec["effort_map"]) for model, spec in laddered.items()
         },
         "modelDefaultReasoningEfforts": {
-            model: DEFAULT_REASONING_EFFORT for model in MODELS
+            model: spec["default_effort"] for model, spec in laddered.items()
         },
         "preserveReasoningContentModels": list(MODELS),
     }

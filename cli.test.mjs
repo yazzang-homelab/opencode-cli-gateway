@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -50,13 +51,16 @@ const step = (
 const attempt = (value = 0) => ({ type: "gateway.attempt", step: value });
 const delta = (text, kind = "text") => ({ type: "gateway.delta", kind, text });
 
-// Stands in for `opencode run` with the plugin loaded: it writes plugin
-// events to the gateway socket, optional CLI stdout lines, then idles like a
-// run whose follow-up model request is held by `chat.params`.
+// Stands in for `opencode run` with the plugin loaded: it reads the plugin
+// options from the generated global config, writes plugin events to the
+// gateway socket and optional CLI stdout lines, then idles like a run whose
+// plugin is still holding the model response.
 function cli({ events = [], stdout = [], exit = false }) {
   return `
 const net = require("node:net");
-const socket = net.connect(process.env.GATEWAY_EVENT_SOCKET, () => {
+const fs = require("node:fs");
+const config = JSON.parse(fs.readFileSync(process.env.XDG_CONFIG_HOME + "/opencode/opencode.json", "utf8"));
+const socket = net.connect(config.plugins[0].options.socket, () => {
   for (const line of ${JSON.stringify(stdout)}) console.log(JSON.stringify(line));
   for (const event of ${JSON.stringify(events)}) socket.write(JSON.stringify(event) + "\\n");
   ${exit ? "socket.end(() => process.exit(0));" : "setInterval(() => {}, 1000);"}
@@ -72,9 +76,18 @@ async function fixture(t, script, options = {}) {
     stateDir: join(root, "state"),
     cacheDir: join(root, "cache"),
     maxWorkers: options.maxWorkers ?? 4,
-    plugin: "/gateway/opencode-plugin.mjs",
+    plugin: "/gateway/plugin",
     spawnProcess(executable, args, spawnOptions) {
-      captured.push({ executable, args, options: spawnOptions });
+      const configFile = join(
+        spawnOptions.env.XDG_CONFIG_HOME,
+        "opencode",
+        "opencode.json",
+      );
+      const config = JSON.parse(readFileSync(configFile, "utf8"));
+      const spec = JSON.parse(
+        readFileSync(config.plugins[0].options.request, "utf8"),
+      );
+      captured.push({ executable, args, options: spawnOptions, config, spec });
       const child = spawn(process.execPath, ["-e", script], spawnOptions);
       children.push(child);
       return child;
@@ -107,16 +120,27 @@ test("요청 내용은 argv에 넣지 않고 격리된 공식 CLI와 플러그�
     prompt_tokens_details: { cached_tokens: 20 },
     completion_tokens_details: { reasoning_tokens: 3 },
   });
-  const [{ executable, args, options }] = f.captured;
+  const [{ executable, args, options, config, spec }] = f.captured;
   assert.equal(executable, "/official/opencode");
-  assert.equal(args.join(" ").includes("한글"), false);
-  assert.equal(args.includes("--auto"), false);
+  assert.deepEqual(args, [
+    "run",
+    "--standalone",
+    "--model",
+    "opencode/deepseek-v4.1-flash-free",
+    "--format",
+    "json",
+    "Continue.",
+  ]);
   assert.equal(options.shell, undefined);
   assert.equal(options.env.GATEWAY_TOKEN_FILE, undefined);
   assert.equal(options.env.OPENCODE_API_KEY, undefined);
-  const config = JSON.parse(options.env.OPENCODE_CONFIG_CONTENT);
-  assert.deepEqual(config.plugin, ["file:///gateway/opencode-plugin.mjs"]);
-  assert.deepEqual(config.permission, { "*": "ask" });
+  assert.equal(options.env.XDG_CACHE_HOME, join(f.root, "cache"));
+  assert.equal(config.plugins.length, 1);
+  assert.equal(config.plugins[0].package, "/gateway/plugin");
+  assert.equal(config.share, "disabled");
+  assert.deepEqual(spec.messages, [
+    { role: "user", content: "--command bad\n한글 입력" },
+  ]);
   assert.deepEqual(await readdir(join(f.root, "state")), []);
 });
 
@@ -157,7 +181,7 @@ test("모델의 함수 호출은 ID·이름·인자를 그대로 반환하고 �
       name: "lookup",
       arguments: { key: "beta" },
     },
-    step("tool-calls"),
+    step("tool_calls"),
   ];
   const f = await fixture(t, cli({ events }));
   const result = await f.runner.run({
@@ -202,7 +226,7 @@ test("선언되지 않은 함수·내장 도구·필수 호출 누락은 명시�
       [
         attempt(),
         { type: "gateway.call", id: "c1", name: "bash", arguments: {} },
-        step("tool-calls"),
+        step("tool_calls"),
       ],
       "invalid_tool_call",
       "auto",
@@ -211,7 +235,7 @@ test("선언되지 않은 함수·내장 도구·필수 호출 누락은 명시�
       [
         attempt(),
         { type: "gateway.native_call", name: "invalid" },
-        step("tool-calls"),
+        step("tool_calls"),
       ],
       "native_tool_call",
       "auto",
@@ -228,6 +252,16 @@ test("선언되지 않은 함수·내장 도구·필수 호출 누락은 명시�
       [attempt(), delta("텍스트"), step("stop")],
       "tool_choice_unsatisfied",
       "required",
+    ],
+    [
+      [attempt(), delta("텍스트"), step("stop")],
+      "tool_choice_unsatisfied",
+      { type: "function", function: { name: "lookup" } },
+    ],
+    [
+      [attempt(), delta("텍스트"), step("tool_calls")],
+      "incomplete_cli_output",
+      "auto",
     ],
     [
       [attempt(), { type: "gateway.fatal", code: "unexpected_native_tool" }],
@@ -271,69 +305,53 @@ test("출력 전 재시도는 허용하고 출력 뒤 같은 단계 재시도는
   );
 });
 
-test("텍스트 전용 요청은 거절된 내장 도구 단계 뒤 최종 답변을 이어 붙인다", async (t) => {
-  const events = [
-    attempt(0),
-    delta("A"),
-    { type: "gateway.native_rejected", name: "glob" },
-    attempt(1),
-    delta("B"),
-    step("stop", {
-      input: 20,
-      output: 4,
-      reasoning: 0,
-      cache: { read: 0, write: 0 },
-    }),
-  ];
-  const f = await fixture(t, cli({ events }));
-  const result = await f.runner.run(request);
-  assert.equal(result.text, "AB");
-  assert.equal(result.usage.total_tokens, 24);
-});
-
-test("호출자에 없는 OpenCode read 호출은 거절 처리하고 호출자 함수만 반환한다", async (t) => {
-  const events = [
-    attempt(0),
-    { type: "gateway.native_rejected", name: "read" },
-    {
-      type: "gateway.call",
-      id: "call_x",
-      name: "lookup",
-      arguments: { key: "k" },
-    },
-    step("tool-calls"),
-  ];
-  const f = await fixture(t, cli({ events }));
-  const result = await f.runner.run({
-    ...request,
-    tools: [lookup],
-    toolChoice: "auto",
-  });
-  assert.equal(result.finishReason, "tool_calls");
-  assert.deepEqual(
-    result.toolCalls.map((call) => call.function.name),
-    ["lookup"],
-  );
-});
-
-test("공식 CLI의 상류 오류 상태와 메시지를 보존한다", async (t) => {
-  const f = await fixture(
+test("상류 오류 상태와 메시지를 기다리지 않고 그대로 돌려준다", async (t) => {
+  const plugin = await fixture(
     t,
     cli({
-      stdout: [
+      events: [
+        attempt(),
         {
-          type: "error",
-          error: { data: { statusCode: 429, message: "rate limited" } },
+          type: "gateway.upstream_error",
+          status: 429,
+          message: "Free usage limit reached.",
         },
       ],
     }),
   );
   await assert.rejects(
-    f.runner.run(request),
-    (error) => error.status === 429 && error.message === "rate limited",
+    plugin.runner.run(request),
+    (error) =>
+      error.status === 429 &&
+      error.code === "upstream_error" &&
+      error.message === "Free usage limit reached.",
+  );
+  const unknown = await fixture(
+    t,
+    cli({
+      events: [attempt(), { type: "gateway.upstream_error", status: 500 }],
+    }),
+  );
+  await assert.rejects(
+    unknown.runner.run(request),
+    (error) => error.status === 502,
+  );
+  const stdout = await fixture(
+    t,
+    cli({
+      stdout: [
+        {
+          type: "error",
+          error: { type: "provider.free-limit", status: 429, message: "limit" },
+        },
+      ],
+    }),
+  );
+  await assert.rejects(
+    stdout.runner.run(request),
+    (error) => error.status === 429 && error.message === "limit",
   );
 });
-
 test("단계 완료 없이 종료한 CLI는 성공으로 처리하지 않는다", async (t) => {
   const f = await fixture(
     t,
@@ -370,7 +388,7 @@ test("동시 실행 상한을 넘는 요청은 429로 거절한다", async (t) =
   await assert.rejects(first);
 });
 
-test("플러그인 요청은 원래 역할·도구 결과·함수 정의·생성 설정을 그대로 옮긴다", () => {
+test("플러그인 요청은 원래 역할·도구 결과·함수 정의·생성 설정을 Chat 본문 형식으로 옮긴다", () => {
   const spec = pluginRequest({
     ...request,
     messages: [
@@ -379,7 +397,15 @@ test("플러그인 요청은 원래 역할·도구 결과·함수 정의·생성
       {
         role: "user",
         content: "질문",
-        parts: [{ type: "text", text: "질문" }],
+        parts: [
+          { type: "text", text: "질문" },
+          {
+            type: "file",
+            mime: "image/png",
+            url: "data:image/png;base64,AAAA",
+            filename: "image",
+          },
+        ],
       },
       {
         role: "assistant",
@@ -394,61 +420,61 @@ test("플러그인 요청은 원래 역할·도구 결과·함수 정의·생성
         ],
       },
       { role: "tool", tool_call_id: "call_x", content: "실제 결과" },
+      { role: "assistant", content: "끝" },
     ],
-    tools: [
-      lookup,
-      {
-        type: "function",
-        function: { name: "other", parameters: { type: "object" } },
-      },
-    ],
+    tools: [lookup],
     toolChoice: { type: "function", function: { name: "lookup" } },
     parallelToolCalls: false,
     temperature: 0.3,
-    options: { seed: 7 },
+    options: { seed: 7, reasoning_effort: "max" },
   });
-  assert.equal(spec.system, "S1\n\nD1");
-  assert.equal(spec.mode, "caller");
-  assert.equal(spec.toolChoice, "required");
-  assert.deepEqual(spec.tools, [
-    {
-      name: "lookup",
-      description: "Find a value.",
-      parameters: lookup.function.parameters,
+  assert.deepEqual(spec, {
+    messages: [
+      { role: "system", content: "S1" },
+      { role: "system", content: "D1" },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "질문" },
+          {
+            type: "image_url",
+            image_url: { url: "data:image/png;base64,AAAA" },
+          },
+        ],
+      },
+      {
+        role: "assistant",
+        content: null,
+        reasoning_content: "이전 추론",
+        tool_calls: [
+          {
+            id: "call_x",
+            type: "function",
+            function: { name: "lookup", arguments: '{"key":"k"}' },
+          },
+        ],
+      },
+      { role: "tool", tool_call_id: "call_x", content: "실제 결과" },
+      { role: "assistant", content: "끝" },
+    ],
+    tools: [lookup],
+    toolChoice: { type: "function", function: { name: "lookup" } },
+    parallelToolCalls: false,
+    params: {
+      max_completion_tokens: 512,
+      seed: 7,
+      reasoning_effort: "max",
+      temperature: 0.3,
     },
-  ]);
-  assert.deepEqual(spec.messages, [
-    { role: "user", parts: [{ type: "text", text: "질문" }] },
-    {
-      role: "assistant",
-      text: "",
-      reasoning: "이전 추론",
-      toolCalls: [
-        {
-          id: "call_x",
-          name: "lookup",
-          arguments: { key: "k" },
-          output: "실제 결과",
-        },
-      ],
-    },
-  ]);
-  assert.deepEqual(spec.sampling, {
-    temperature: 0.3,
-    topP: undefined,
-    maxOutputTokens: 512,
   });
-  assert.deepEqual(spec.options, { parallel_tool_calls: false, seed: 7 });
-  // The AI SDK drops snake_case `reasoning_effort`; only `reasoningEffort` reaches the upstream body.
-  assert.deepEqual(
-    pluginRequest({
-      ...request,
-      options: { reasoning_effort: "max", stop: ["x"] },
-    }).options,
-    {
-      stop: ["x"],
-      reasoningEffort: "max",
-    },
-  );
-  assert.equal(pluginRequest(request).mode, "native");
+  const text = pluginRequest({
+    ...request,
+    tools: [lookup],
+    toolChoice: "none",
+  });
+  assert.deepEqual(text.tools, []);
+  assert.equal(text.toolChoice, "none");
+  assert.deepEqual(text.messages, [
+    { role: "user", content: "--command bad\n한글 입력" },
+  ]);
 });

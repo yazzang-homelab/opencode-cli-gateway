@@ -6,94 +6,72 @@ import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 import { GatewayError } from "./errors.mjs";
 
-const PLUGIN = fileURLToPath(new URL("./opencode-plugin.mjs", import.meta.url));
-const OPENCODE_VERSION = "1.19.0";
+const PLUGIN = fileURLToPath(new URL("./plugin", import.meta.url));
 const LINE_LIMIT = 4 * 1024 * 1024;
 const UPSTREAM_STATUS = new Set([400, 401, 403, 404, 408, 413, 429, 503]);
 const FINISH = {
   stop: "stop",
   length: "length",
-  "content-filter": "content_filter",
+  content_filter: "content_filter",
 };
 
+const isNamed = (choice) => typeof choice === "object" && choice !== null;
 const failure = (code, message, status = 502) =>
   new GatewayError(status, code, message);
 const count = (value) =>
   Number.isSafeInteger(value) && value >= 0 ? value : 0;
 
-// Converts the normalized Chat request into the plugin's request file. The
-// plugin rebuilds the same roles, tool calls and results as OpenCode messages.
-export function pluginRequest(request) {
-  let index = 0;
-  const system = [];
-  while (
-    index < request.messages.length &&
-    ["system", "developer"].includes(request.messages[index].role)
-  )
-    system.push(request.messages[index++].content);
-  const messages = [];
-  for (const message of request.messages.slice(index)) {
-    if (message.role === "user") {
-      messages.push({ role: "user", parts: message.parts });
-    } else if (message.role === "assistant") {
-      messages.push({
-        role: "assistant",
-        text: message.content,
-        reasoning: message.reasoning_content ?? "",
-        toolCalls: (message.tool_calls ?? []).map((call) => ({
-          id: call.id,
-          name: call.function.name,
-          arguments: JSON.parse(call.function.arguments),
-          output: undefined,
-        })),
-      });
-    } else if (message.role === "tool") {
-      const call = messages
-        .at(-1)
-        .toolCalls.find((item) => item.id === message.tool_call_id);
-      call.output = message.content;
-    }
+// Chat Completions history for the upstream body. The plugin keeps
+// OpenCode's own system prompt in front of these messages.
+function chatMessage(message) {
+  if (message.role === "system" || message.role === "developer")
+    return { role: "system", content: message.content };
+  if (message.role === "user") {
+    const parts = message.parts ?? [{ type: "text", text: message.content }];
+    if (parts.every((part) => part.type === "text"))
+      return { role: "user", content: message.content };
+    return {
+      role: "user",
+      content: parts.map((part) =>
+        part.type === "text"
+          ? { type: "text", text: part.text }
+          : { type: "image_url", image_url: { url: part.url } },
+      ),
+    };
   }
-  const named =
-    typeof request.toolChoice === "object"
-      ? request.toolChoice.function.name
-      : undefined;
-  const caller = request.tools.length > 0 && request.toolChoice !== "none";
+  if (message.role === "tool")
+    return {
+      role: "tool",
+      tool_call_id: message.tool_call_id,
+      content: message.content,
+    };
   return {
-    system: system.length ? system.join("\n\n") : null,
-    mode: caller ? "caller" : "native",
-    toolChoice:
-      caller && (named || request.toolChoice === "required")
-        ? "required"
-        : "auto",
-    tools: caller
-      ? request.tools
-          .filter((tool) => !named || tool.function.name === named)
-          .map((tool) => ({
-            name: tool.function.name,
-            description: tool.function.description ?? "",
-            parameters: tool.function.parameters,
-          }))
-      : [],
-    messages,
-    sampling: {
-      temperature: request.temperature,
-      topP: request.topP,
-      maxOutputTokens: request.maxOutputTokens,
-    },
-    options: providerOptions(request, caller),
+    role: "assistant",
+    content: message.content || (message.tool_calls ? null : ""),
+    ...(message.reasoning_content !== undefined
+      ? { reasoning_content: message.reasoning_content }
+      : {}),
+    ...(message.tool_calls ? { tool_calls: message.tool_calls } : {}),
   };
 }
 
-// OpenCode passes these as AI SDK providerOptions. The openai-compatible
-// provider forwards unknown keys verbatim but rebuilds `reasoning_effort`
-// from the camelCase `reasoningEffort` option and drops the snake_case key.
-function providerOptions(request, caller) {
-  const { reasoning_effort: reasoningEffort, ...rest } = request.options;
+// The request file the plugin turns into the upstream body. Function
+// definitions only travel when the caller lets the model call them.
+export function pluginRequest(request) {
+  const caller = request.tools.length > 0 && request.toolChoice !== "none";
+  const params = {
+    max_completion_tokens: request.maxOutputTokens,
+    ...request.options,
+  };
+  if (request.temperature !== undefined)
+    params.temperature = request.temperature;
+  if (request.topP !== undefined) params.top_p = request.topP;
   return {
-    ...(caller ? { parallel_tool_calls: request.parallelToolCalls } : {}),
-    ...rest,
-    ...(reasoningEffort ? { reasoningEffort } : {}),
+    messages: request.messages.map(chatMessage),
+    tools: caller ? request.tools : [],
+    toolChoice: caller ? request.toolChoice : "none",
+    parallelToolCalls: request.parallelToolCalls,
+    params,
   };
 }
 
@@ -146,31 +124,33 @@ export function createCliRunner({
     await mkdir(stateDir, { recursive: true, mode: 0o700 });
     await mkdir(cacheDir, { recursive: true, mode: 0o700 });
     run.work = await mkdtemp(join(stateDir, "request-"));
-    const config = join(run.work, "config", "opencode");
-    await mkdir(join(config, "node_modules"), { recursive: true });
-    // OpenCode installs its plugin SDK into every config directory before
-    // loading plugins. This plugin imports nothing from it, so the pinned
-    // dependency is declared as satisfied instead of reaching npm per request.
-    const dependency = { "@opencode-ai/plugin": OPENCODE_VERSION };
-    await writeFile(
-      join(config, "package.json"),
-      JSON.stringify({ dependencies: dependency }),
-    );
-    await writeFile(
-      join(config, "package-lock.json"),
-      JSON.stringify({
-        lockfileVersion: 3,
-        packages: { "": { dependencies: dependency } },
-      }),
-    );
     const requestFile = join(run.work, "request.json");
     const spec = pluginRequest(request);
     await writeFile(requestFile, JSON.stringify(spec), {
       mode: 0o600,
       flag: "wx",
     });
-    const declared = new Set(spec.tools.map((tool) => tool.name));
+    const declared = new Set(spec.tools.map((tool) => tool.function.name));
     const socketPath = join(run.work, "events.sock");
+    // OpenCode reads its global config from XDG_CONFIG_HOME; the request and
+    // event socket reach the plugin as its options, never through argv.
+    const config = join(run.work, "config", "opencode");
+    await mkdir(config, { recursive: true });
+    await writeFile(
+      join(config, "opencode.json"),
+      JSON.stringify({
+        plugins: [
+          {
+            package: plugin,
+            options: { request: requestFile, socket: socketPath },
+          },
+        ],
+        share: "disabled",
+        autoupdate: false,
+        snapshot: false,
+      }),
+      { mode: 0o600 },
+    );
 
     const state = {
       step: -1,
@@ -179,7 +159,6 @@ export function createCliRunner({
       reasoning: "",
       calls: [],
       ids: new Set(),
-      rejected: 0,
     };
     let settle;
     const outcome = new Promise((resolve, reject) => {
@@ -197,7 +176,7 @@ export function createCliRunner({
       if (run.settled) return;
       switch (event.type) {
         case "gateway.attempt":
-          // A repeated step index is OpenCode retrying the same model step.
+          // A repeated step index is the plugin asking the model again.
           // Output already sent to the caller cannot be withdrawn.
           if (event.step === state.step && state.streamed)
             return fail(
@@ -213,9 +192,19 @@ export function createCliRunner({
           state.step = event.step;
           state.streamed = false;
           return;
-        case "gateway.native_rejected":
-          state.rejected += 1;
-          return;
+        case "gateway.upstream_error": {
+          const status = Number(event.status);
+          return fail(
+            new GatewayError(
+              UPSTREAM_STATUS.has(status) ? status : 502,
+              "upstream_error",
+              String(event.message ?? "OpenCode upstream failed").slice(
+                0,
+                1000,
+              ),
+            ),
+          );
+        }
         case "gateway.delta":
           if (
             typeof event.text !== "string" ||
@@ -289,7 +278,7 @@ export function createCliRunner({
             : state.calls.slice(0, 1);
           let finishReason;
           if (calls.length) finishReason = "tool_calls";
-          else if (spec.toolChoice === "required")
+          else if (spec.toolChoice === "required" || isNamed(spec.toolChoice))
             return fail(
               failure(
                 "tool_choice_unsatisfied",
@@ -355,25 +344,11 @@ export function createCliRunner({
     });
     if (run.settled) return outcome;
 
-    const configContent = {
-      share: "disabled",
-      autoupdate: false,
-      snapshot: false,
-      formatter: false,
-      lsp: false,
-      plugin: [`file://${plugin}`],
-      // Non-interactive `opencode run` rejects every `ask`; OpenCode tools are
-      // hidden for caller-tool requests and rejected for text-only requests.
-      permission: { "*": "ask" },
-      agent: { title: { disable: true } },
-      experimental: { continue_loop_on_deny: true },
-    };
     const child = spawnProcess(
       executable,
       [
         "run",
-        "--agent",
-        "build",
+        "--standalone",
         "--model",
         `opencode/${request.modelId}`,
         "--format",
@@ -394,14 +369,6 @@ export function createCliRunner({
           XDG_DATA_HOME: join(run.work, "data"),
           XDG_STATE_HOME: join(run.work, "state"),
           XDG_CACHE_HOME: cacheDir,
-          OPENCODE_DISABLE_PROJECT_CONFIG: "true",
-          OPENCODE_DISABLE_AUTOUPDATE: "true",
-          OPENCODE_DISABLE_EXTERNAL_SKILLS: "true",
-          OPENCODE_DISABLE_CLAUDE_CODE: "true",
-          OPENCODE_DISABLE_LSP_DOWNLOAD: "true",
-          OPENCODE_CONFIG_CONTENT: JSON.stringify(configContent),
-          GATEWAY_REQUEST_FILE: requestFile,
-          GATEWAY_EVENT_SOCKET: socketPath,
         },
       },
     );
@@ -422,13 +389,15 @@ export function createCliRunner({
           return;
         }
         if (event.type !== "error") return;
-        const data = event.error?.data ?? {};
-        const status = Number(data.statusCode);
+        const status = Number(event.error?.status);
         fail(
           new GatewayError(
             UPSTREAM_STATUS.has(status) ? status : 502,
             "upstream_error",
-            String(data.message ?? "OpenCode CLI failed").slice(0, 1000),
+            String(event.error?.message ?? "OpenCode CLI failed").slice(
+              0,
+              1000,
+            ),
           ),
         );
       },

@@ -8,14 +8,28 @@ import {
   validateHistory,
 } from "./tools.mjs";
 
-// OpenCode free models served by the fixed CLI. Both document a 200K
-// context, 32K output and the `low`/`high`/`max` effort ladder on models.dev,
-// verified against the free upstream. GLM lists image input, but the free
-// upstream ignores it (prompt tokens do not change, colors are guessed), so the
-// gateway refuses images for it instead of advertising them.
+// OpenCode free models served by the pinned CLI. Context, output limit,
+// input types and the native effort ladder follow models.dev and were checked
+// against the free upstream. Iceman documents no effort control.
 export const MODELS = Object.freeze({
-  "deepseek-v4.1-flash-free": Object.freeze({ input: ["text", "image"] }),
-  "glm-5.3-flash-free": Object.freeze({ input: ["text"] }),
+  "deepseek-v4.1-flash-free": Object.freeze({
+    input: ["text", "image"],
+    efforts: ["low", "high", "max"],
+    context: 200000,
+    maxOutput: 32000,
+  }),
+  "tidepool-alpha-free": Object.freeze({
+    input: ["text"],
+    efforts: ["minimal", "low", "medium", "high", "xhigh", "max"],
+    context: 1048576,
+    maxOutput: 131072,
+  }),
+  "iceman-free": Object.freeze({
+    input: ["text"],
+    efforts: [],
+    context: 262144,
+    maxOutput: 131072,
+  }),
 });
 const MAX_STREAM_BUFFER_BYTES = 1024 * 1024;
 const ROLES = new Set(["system", "developer", "user", "assistant", "tool"]);
@@ -25,7 +39,6 @@ const IMAGE_PART_FIELDS = new Set(["type", "image_url"]);
 const IMAGE_URL_FIELDS = new Set(["url", "detail"]);
 const IMAGE_DATA =
   /^data:(image\/(?:png|jpeg|gif|webp));base64,[A-Za-z0-9+/]+={0,2}$/;
-const REASONING_EFFORTS = new Set(["low", "high", "max"]);
 const STREAM_FIELDS = new Set(["include_usage"]);
 const REQUEST_FIELDS = new Set([
   "model",
@@ -52,17 +65,13 @@ const REQUEST_FIELDS = new Set([
 const METADATA = Object.freeze({
   gateway: "opencode-cli-stateless",
   request_semantics:
-    "Each request is one model step of the official OpenCode CLI. Caller system/developer text, message roles, tool calls, tool results and function definitions replace OpenCode's own prompt, history and tools.",
+    "Each request is one model call of the official OpenCode CLI. OpenCode's own system prompt stays first and caller system/developer text follows it; caller messages, tool calls, tool results and function definitions replace OpenCode's history and tools, except that OpenCode's read definition stays when the caller defines no read function.",
   supports_tool_use: true,
   tool_execution: "caller_owned",
   tool_continuation: "stateless_history",
   streaming: "token_deltas",
 });
-const REASONING = Object.freeze({
-  supports_reasoning: true,
-  reasoning_efforts: [...REASONING_EFFORTS],
-  reasoning_content: "streamed_and_accepted_in_history",
-});
+const REASONING_CONTENT = "streamed_and_accepted_in_history";
 
 function invalid(message, code = "invalid_request") {
   return new GatewayError(400, code, message);
@@ -85,9 +94,9 @@ function onlyFields(object, fields, label) {
   }
 }
 
-function tokenLimit(value, label) {
-  if (!Number.isInteger(value) || value < 1 || value > 32000) {
-    throw invalid(`${label}은 1부터 32000 사이의 정수여야 합니다.`);
+function tokenLimit(value, label, max) {
+  if (!Number.isInteger(value) || value < 1 || value > max) {
+    throw invalid(`${label}은 1부터 ${max} 사이의 정수여야 합니다.`);
   }
   return value;
 }
@@ -259,9 +268,15 @@ function normalizeRequest(body, models) {
       includeUsage = body.stream_options.include_usage;
     }
   }
-  if (has(body, "max_tokens")) tokenLimit(body.max_tokens, "max_tokens");
+  const model = models[body.model];
+  if (has(body, "max_tokens"))
+    tokenLimit(body.max_tokens, "max_tokens", model.maxOutput);
   if (has(body, "max_completion_tokens"))
-    tokenLimit(body.max_completion_tokens, "max_completion_tokens");
+    tokenLimit(
+      body.max_completion_tokens,
+      "max_completion_tokens",
+      model.maxOutput,
+    );
   if (
     has(body, "max_tokens") &&
     has(body, "max_completion_tokens") &&
@@ -304,7 +319,7 @@ function normalizeRequest(body, models) {
     );
   if (!normalized.messages.some((m) => m.role === "user"))
     throw invalid("적어도 하나의 user 메시지가 필요합니다.");
-  normalized.options = extraOptions(body);
+  normalized.options = extraOptions(body, model);
   if (has(body, "temperature"))
     normalized.temperature = sampling(body.temperature, 0, 2, "temperature");
   if (has(body, "top_p")) normalized.topP = sampling(body.top_p, 0, 1, "top_p");
@@ -313,7 +328,7 @@ function normalizeRequest(body, models) {
 
 // Chat Completions fields OpenCode's openai-compatible provider forwards
 // verbatim through providerOptions; they reach the upstream request body.
-function extraOptions(body) {
+function extraOptions(body, model) {
   const options = {};
   if (has(body, "stop")) {
     const stop = typeof body.stop === "string" ? [body.stop] : body.stop;
@@ -334,8 +349,13 @@ function extraOptions(body) {
   for (const key of ["frequency_penalty", "presence_penalty"])
     if (has(body, key)) options[key] = sampling(body[key], -2, 2, key);
   if (has(body, "reasoning_effort")) {
-    if (!REASONING_EFFORTS.has(body.reasoning_effort))
-      throw invalid("reasoning_effort는 low·high·max 중 하나여야 합니다.");
+    if (!model.efforts.includes(body.reasoning_effort))
+      throw invalid(
+        model.efforts.length
+          ? `reasoning_effort는 ${model.efforts.join("·")} 중 하나여야 합니다.`
+          : "이 모델은 reasoning_effort를 지원하지 않습니다.",
+        "unsupported_parameter",
+      );
     options.reasoning_effort = body.reasoning_effort;
   }
   if (has(body, "user")) {
@@ -874,11 +894,13 @@ export function createGateway({
             owned_by: "opencode-cli-gateway",
             supports_tool_use: true,
             supports_vision: model.input.includes("image"),
-            context_window: 200000,
-            context_length: 200000,
-            max_output_tokens: 32000,
+            context_window: model.context,
+            context_length: model.context,
+            max_output_tokens: model.maxOutput,
             input_modalities: [...model.input],
-            ...REASONING,
+            supports_reasoning: true,
+            reasoning_efforts: [...model.efforts],
+            reasoning_content: REASONING_CONTENT,
             metadata: METADATA,
           })),
         });

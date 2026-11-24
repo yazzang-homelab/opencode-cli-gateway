@@ -85,27 +85,49 @@ class PublicScriptTests(unittest.TestCase):
                     payload["adminTokenFile"], "~/.opencodex/admin-api-token"
                 )
 
-    def test_registration_declares_native_reasoning_effort_ladder(self):
+    def test_registration_declares_each_models_own_limits_and_ladder(self):
         provider = register.registration("p", "http://127.0.0.1:8940/v1", "x" * 40)[
             "provider"
         ]
-        models = ["deepseek-v4.1-flash-free", "glm-5.3-flash-free"]
+        models = ["deepseek-v4.1-flash-free", "tidepool-alpha-free", "iceman-free"]
         self.assertEqual(provider["models"], models)
         self.assertEqual(provider["defaultModel"], models[0])
-        for model in models:
-            self.assertEqual(
-                provider["modelReasoningEfforts"][model], ["low", "high", "max"]
-            )
-            mapped = provider["modelReasoningEffortMap"][model]
-            self.assertTrue(set(mapped.values()) <= {"low", "high", "max"})
-            self.assertEqual(mapped["xhigh"], "max")
-            self.assertEqual(provider["modelDefaultReasoningEfforts"][model], "high")
-            self.assertEqual(provider["modelMaxOutputTokens"][model], 32000)
-            self.assertIn(model, provider["modelDisplayNames"])
-        self.assertEqual(provider["preserveReasoningContentModels"], models)
         self.assertEqual(
-            provider["modelCapabilities"][models[1]]["inputModalities"], ["text"]
+            provider["modelReasoningEfforts"],
+            {
+                models[0]: ["low", "high", "max"],
+                models[1]: ["minimal", "low", "medium", "high", "xhigh", "max"],
+                models[2]: [],
+            },
         )
+        # Every mapped level lands on the model's own ladder; the empty
+        # ladder has no map or default, so the proxy drops the effort.
+        for model in models[:2]:
+            mapped = provider["modelReasoningEffortMap"][model]
+            self.assertTrue(
+                set(mapped.values()) <= set(provider["modelReasoningEfforts"][model])
+            )
+            self.assertIn(
+                provider["modelDefaultReasoningEfforts"][model],
+                provider["modelReasoningEfforts"][model],
+            )
+        self.assertEqual(provider["modelReasoningEffortMap"][models[0]]["xhigh"], "max")
+        self.assertNotIn(models[2], provider["modelReasoningEffortMap"])
+        self.assertNotIn(models[2], provider["modelDefaultReasoningEfforts"])
+        self.assertEqual(
+            provider["modelMaxOutputTokens"],
+            {models[0]: 32000, models[1]: 131072, models[2]: 131072},
+        )
+        self.assertEqual(provider["contextWindow"], 200000)
+        self.assertEqual(
+            provider["modelContextWindows"], {models[1]: 1048576, models[2]: 262144}
+        )
+        self.assertEqual(
+            [provider["modelCapabilities"][m]["inputModalities"] for m in models],
+            [["text", "image"], ["text"], ["text"]],
+        )
+        self.assertEqual(sorted(provider["modelDisplayNames"]), sorted(models))
+        self.assertEqual(provider["preserveReasoningContentModels"], models)
 
     def test_update_is_explicit_and_carries_full_registration(self):
         with tempfile.TemporaryDirectory() as directory:
