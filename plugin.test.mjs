@@ -225,7 +225,11 @@ async function harness(t, overrides = {}) {
   await new Promise((resolve) => server.listen(socketPath, resolve));
   const hooks = {};
   const ctx = {
-    options: { request: requestFile, socket: socketPath },
+    options: {
+      request: requestFile,
+      socket: socketPath,
+      rateRetryDelaysMs: [0, 0],
+    },
     session: { hook: async (name, callback) => void (hooks[name] = callback) },
     tool: {
       hook: async (name, callback) => void (hooks[`tool.${name}`] = callback),
@@ -346,9 +350,8 @@ test("플러그인은 상류 스트림을 이벤트로 넘기고 OpenCode에는 
   assert.equal(h.events.at(-1).code, "native_tool_execution");
 });
 
-test("상류 오류 응답은 상태와 메시지를 그대로 알린다", async (t) => {
-  const h = await harness(t);
-  const { done } = await h.send(
+const limited = () =>
+  new Response(
     JSON.stringify({
       type: "error",
       error: {
@@ -356,14 +359,94 @@ test("상류 오류 응답은 상태와 메시지를 그대로 알린다", async
         message: "Free usage limit reached.",
       },
     }),
-    429,
+    { status: 429, headers: { "retry-after": "40000" } },
+  );
+
+test("상류 오류 응답은 상태와 메시지를 그대로 알린다", async (t) => {
+  const h = await harness(t);
+  globalThis.fetch = async () =>
+    assert.fail("429가 아닌 오류는 다시 묻지 않는다");
+  const { done } = await h.send(
+    JSON.stringify({ error: { message: "Bad key" } }),
+    401,
   );
   await done;
   await h.settle();
+  assert.deepEqual(h.events, [
+    { type: "gateway.attempt", step: 0 },
+    { type: "gateway.upstream_error", status: 401, message: "Bad key" },
+  ]);
+});
+
+test("상류 429는 출력 전이면 같은 본문으로 다시 묻고 성공하면 그 답을 넘긴다", async (t) => {
+  const h = await harness(t);
+  const bodies = [];
+  const replies = [
+    limited(),
+    new Response(sse(chunk({ content: "됨" }, "stop"), usage)),
+  ];
+  globalThis.fetch = async (url, init) => {
+    bodies.push(init.body);
+    return replies.shift();
+  };
+  const { request, done } = await h.send(limited().body, 429);
+  await done;
+  await h.settle();
+  const sent = await request.text();
+  assert.deepEqual(bodies, [sent, sent]);
+  assert.deepEqual(
+    h.events.map((event) => event.type),
+    [
+      "gateway.retry",
+      "gateway.retry",
+      "gateway.attempt",
+      "gateway.delta",
+      "gateway.step",
+    ],
+  );
+  assert.deepEqual(h.events[1], {
+    type: "gateway.retry",
+    status: 429,
+    retry: 2,
+    delayMs: 0,
+    retryAfter: "40000",
+  });
+  assert.equal(h.events.at(-1).reason, "stop");
+});
+
+test("상류 429가 재시도 횟수를 넘으면 마지막 오류를 그대로 알린다", async (t) => {
+  const h = await harness(t);
+  let fetched = 0;
+  globalThis.fetch = async () => {
+    fetched += 1;
+    return limited();
+  };
+  const { done } = await h.send(limited().body, 429);
+  await done;
+  await h.settle();
+  assert.equal(fetched, 2);
   assert.deepEqual(h.events.at(-1), {
     type: "gateway.upstream_error",
     status: 429,
     message: "Free usage limit reached.",
+  });
+  assert.equal(
+    h.events.filter((event) => event.type === "gateway.retry").length,
+    2,
+  );
+});
+
+test("재요청이 네트워크 오류로 실패하면 502로 알린다", async (t) => {
+  const h = await harness(t);
+  globalThis.fetch = async () => {
+    throw new Error("socket hang up");
+  };
+  void (await h.send(limited().body, 429)).done;
+  await h.settle();
+  assert.deepEqual(h.events.at(-1), {
+    type: "gateway.upstream_error",
+    status: 502,
+    message: "socket hang up",
   });
 });
 

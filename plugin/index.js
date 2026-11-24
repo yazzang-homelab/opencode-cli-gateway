@@ -18,7 +18,12 @@ import {
 // Model calls per request. Extra attempts only happen when the model called
 // nothing but OpenCode's own `read` and no output reached the caller yet.
 const MAX_ATTEMPTS = 3;
+// Waits before asking again after an upstream 429. OpenCode's free tier
+// answers single requests from one host with intermittent 429s whose
+// Retry-After is hours away, while the next request usually succeeds.
+const RATE_RETRY_DELAYS_MS = [1000, 2000, 4000];
 const never = () => new Promise(() => {});
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export default {
   id: "opencode-cli-gateway",
@@ -33,6 +38,8 @@ export default {
         JSON.stringify({ ...event, type: `gateway.${event.type}` }) + "\n",
       );
     const callerTools = new Set(spec.tools.map((tool) => tool.function.name));
+    const rateRetryDelays =
+      ctx.options.rateRetryDelaysMs ?? RATE_RETRY_DELAYS_MS;
     let request;
     let answered = false;
 
@@ -88,7 +95,38 @@ export default {
       answered = true;
       let response = event.response;
       let streamed = false;
-      for (let attempt = 1; ; attempt += 1) {
+      let attempt = 1;
+      let rateRetries = 0;
+      const ask = async () => {
+        try {
+          return await fetch(request.url, request);
+        } catch (error) {
+          emit({
+            type: "upstream_error",
+            status: 502,
+            message: String(error.message ?? error),
+          });
+          return never();
+        }
+      };
+      for (;;) {
+        // Nothing reached the caller before a status line, so a rate-limited
+        // call can be repeated with the same request.
+        if (response.status === 429 && rateRetries < rateRetryDelays.length) {
+          const delayMs = rateRetryDelays[rateRetries];
+          rateRetries += 1;
+          emit({
+            type: "retry",
+            status: 429,
+            retry: rateRetries,
+            delayMs,
+            retryAfter: response.headers.get("retry-after"),
+          });
+          await response.body?.cancel();
+          await sleep(delayMs);
+          response = await ask();
+          continue;
+        }
         emit({ type: "attempt", step: 0 });
         if (response.status !== 200) {
           const text = await response.clone().text();
@@ -143,7 +181,8 @@ export default {
           // The model reached for OpenCode's `read`, which the caller does
           // not own. Ask again while nothing was shown; keep a text answer.
           if (!streamed && attempt < MAX_ATTEMPTS) {
-            response = await fetch(request.url, request);
+            attempt += 1;
+            response = await ask();
             continue;
           }
           if (!result.text) {

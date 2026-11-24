@@ -1235,3 +1235,52 @@ test("호출 이력과 실제 도구 결과는 tool_call_id로 검증하고 runn
       400,
     );
 });
+
+test("요청마다 본문 없이 모델·상태·재시도·소요 시간을 한 줄로 기록한다", async (t) => {
+  const logs = [];
+  let calls = 0;
+  const server = await fixture(t, {
+    log: (entry) => logs.push(entry),
+    run: async (_request, { onRetry }) => {
+      calls += 1;
+      onRetry({ status: 429, retry: 1, delayMs: 1000, retryAfter: "40000" });
+      if (calls === 2)
+        throw new GatewayError(
+          429,
+          "upstream_error",
+          "Free usage limit reached.",
+        );
+      return result();
+    },
+  });
+  assert.equal(
+    (await chat(server, input({ reasoning_effort: "low" }))).status,
+    200,
+  );
+  const limited = await chat(server, input({ stream: true }));
+  assert.equal(limited.status, 429);
+  assert.equal(limited.headers["retry-after"], "1");
+  assert.equal(logs.length, 2);
+  const [ok, failed] = logs;
+  assert.equal(typeof ok.requestId, "string");
+  assert.ok(ok.durationMs >= 0);
+  assert.deepEqual(
+    { ...ok, requestId: undefined, durationMs: undefined },
+    {
+      event: "completion",
+      requestId: undefined,
+      model: MODEL,
+      effort: "low",
+      stream: false,
+      status: 200,
+      durationMs: undefined,
+      retries: [{ status: 429, retry: 1, delayMs: 1000, retryAfter: "40000" }],
+    },
+  );
+  assert.equal(failed.status, 429);
+  assert.equal(failed.code, "upstream_error");
+  assert.equal(failed.message, "Free usage limit reached.");
+  assert.equal(failed.stream, true);
+  assert.equal(failed.retries.length, 1);
+  assert.doesNotMatch(JSON.stringify(logs), /질문/);
+});
