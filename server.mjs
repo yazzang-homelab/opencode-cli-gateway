@@ -537,6 +537,7 @@ export function createGateway({
   maxWorkers = 4,
   timeoutMs = 120000,
   maxBodyBytes = 1048576,
+  log = () => {},
 }) {
   if (typeof token !== "string" || token.length === 0 || /\s/.test(token)) {
     throw new TypeError(
@@ -589,6 +590,10 @@ export function createGateway({
     let includeUsage = false;
     let modelId = Object.keys(models)[0];
     let streamStarted = false;
+    let effort;
+    let failed;
+    const retries = [];
+    const startedAt = Date.now();
     const abort = (reason) => {
       if (!signal.aborted) controller.abort(reason);
     };
@@ -669,6 +674,7 @@ export function createGateway({
     const sendFailure = (original) => {
       if (!writable()) return;
       const error = publicError(original);
+      failed ??= error;
       if (streamStarted) {
         try {
           writeFrame(
@@ -711,6 +717,7 @@ export function createGateway({
         models,
       );
       modelId = parsed.normalized.modelId;
+      effort = parsed.normalized.options?.reasoning_effort;
       ({ stream, includeUsage } = parsed);
       signal.throwIfAborted();
       if (active >= maxWorkers) {
@@ -752,6 +759,7 @@ export function createGateway({
         signal,
         onText,
         onReasoning,
+        onRetry: (retry) => retries.push(retry),
       });
       signal.throwIfAborted();
       if (!writable()) return;
@@ -814,6 +822,24 @@ export function createGateway({
       res.off("close", onDisconnected);
       res.off("error", onDisconnected);
       if (admitted) active -= 1;
+      const error =
+        failed ??
+        (disconnected
+          ? new GatewayError(499, "client_disconnected", "")
+          : undefined);
+      log({
+        event: "completion",
+        requestId,
+        model: modelId,
+        ...(effort ? { effort } : {}),
+        stream,
+        status: error?.status ?? 200,
+        ...(error
+          ? { code: error.code, message: error.message.slice(0, 200) }
+          : {}),
+        durationMs: Date.now() - startedAt,
+        ...(retries.length ? { retries } : {}),
+      });
     }
   }
 

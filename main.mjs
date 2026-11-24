@@ -44,6 +44,7 @@ const server = createGateway({
   maxWorkers,
   timeoutMs,
   maxBodyBytes,
+  log: (entry) => console.log(JSON.stringify(entry)),
 });
 server.on("error", (error) => {
   console.error(

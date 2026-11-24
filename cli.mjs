@@ -110,6 +110,7 @@ export function createCliRunner({
   maxWorkers = 4,
   spawnProcess = spawn,
   plugin = PLUGIN,
+  rateRetryDelaysMs,
 }) {
   if (!Number.isInteger(maxWorkers) || maxWorkers < 1)
     throw new TypeError("유효한 워커 수가 필요합니다.");
@@ -119,7 +120,7 @@ export function createCliRunner({
   async function execute(
     run,
     request,
-    { signal, onText = () => {}, onReasoning = () => {} },
+    { signal, onText = () => {}, onReasoning = () => {}, onRetry = () => {} },
   ) {
     await mkdir(stateDir, { recursive: true, mode: 0o700 });
     await mkdir(cacheDir, { recursive: true, mode: 0o700 });
@@ -142,7 +143,11 @@ export function createCliRunner({
         plugins: [
           {
             package: plugin,
-            options: { request: requestFile, socket: socketPath },
+            options: {
+              request: requestFile,
+              socket: socketPath,
+              ...(rateRetryDelaysMs ? { rateRetryDelaysMs } : {}),
+            },
           },
         ],
         share: "disabled",
@@ -191,6 +196,21 @@ export function createCliRunner({
           }
           state.step = event.step;
           state.streamed = false;
+          return;
+        case "gateway.retry":
+          try {
+            onRetry({
+              status: Number(event.status),
+              retry: Number(event.retry),
+              delayMs: Number(event.delayMs),
+              retryAfter:
+                typeof event.retryAfter === "string"
+                  ? event.retryAfter.slice(0, 64)
+                  : null,
+            });
+          } catch (error) {
+            fail(error);
+          }
           return;
         case "gateway.upstream_error": {
           const status = Number(event.status);

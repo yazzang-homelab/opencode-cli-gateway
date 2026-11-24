@@ -77,6 +77,7 @@ async function fixture(t, script, options = {}) {
     cacheDir: join(root, "cache"),
     maxWorkers: options.maxWorkers ?? 4,
     plugin: "/gateway/plugin",
+    rateRetryDelaysMs: options.rateRetryDelaysMs,
     spawnProcess(executable, args, spawnOptions) {
       const configFile = join(
         spawnOptions.env.XDG_CONFIG_HOME,
@@ -352,6 +353,39 @@ test("상류 오류 상태와 메시지를 기다리지 않고 그대로 돌려�
     (error) => error.status === 429 && error.message === "limit",
   );
 });
+test("상류 429 재시도는 호출자에게 알리고 플러그인 설정에 대기 시간을 넘긴다", async (t) => {
+  const f = await fixture(
+    t,
+    cli({
+      events: [
+        {
+          type: "gateway.retry",
+          status: 429,
+          retry: 1,
+          delayMs: 5,
+          retryAfter: "40000",
+        },
+        attempt(),
+        delta("됨"),
+        step("stop"),
+      ],
+    }),
+    { rateRetryDelaysMs: [5, 10] },
+  );
+  const retries = [];
+  const result = await f.runner.run(request, {
+    onRetry: (retry) => retries.push(retry),
+  });
+  assert.equal(result.text, "됨");
+  assert.deepEqual(retries, [
+    { status: 429, retry: 1, delayMs: 5, retryAfter: "40000" },
+  ]);
+  assert.deepEqual(
+    f.captured[0].config.plugins[0].options.rateRetryDelaysMs,
+    [5, 10],
+  );
+});
+
 test("단계 완료 없이 종료한 CLI는 성공으로 처리하지 않는다", async (t) => {
   const f = await fixture(
     t,
